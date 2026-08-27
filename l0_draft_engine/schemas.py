@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -16,9 +17,18 @@ class TrackSpec(BaseModel):
     lane: str = Field(min_length=1, max_length=128)
     fieldName: str = Field(min_length=1, max_length=128)
 
-    @field_validator("lane", "fieldName")
+    @field_validator("lane", mode="before")
     @classmethod
-    def safe_name(cls, value: str) -> str:
+    def valid_lane(cls, value: object) -> object:
+        if isinstance(value, str) and any(
+            unicodedata.category(character) == "Cc" for character in value
+        ):
+            raise ValueError("must not contain control characters")
+        return value
+
+    @field_validator("fieldName")
+    @classmethod
+    def safe_field_name(cls, value: str) -> str:
         if not SAFE_NAME_RE.fullmatch(value):
             raise ValueError("must contain only letters, digits, underscore, dot, colon, or hyphen")
         return value

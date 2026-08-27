@@ -142,7 +142,11 @@ def _parse_form(form: Any) -> tuple[DraftPayload, dict[str, StarletteUploadFile]
     try:
         payload = DraftPayload.model_validate_json(payload_values[0])
     except (ValidationError, json.JSONDecodeError) as exc:
-        detail = exc.errors() if isinstance(exc, ValidationError) else "payload must be valid JSON"
+        detail = (
+            exc.errors(include_context=False)
+            if isinstance(exc, ValidationError)
+            else "payload must be valid JSON"
+        )
         raise HTTPException(status_code=422, detail=detail) from exc
     expected_fields = {track.fieldName for track in payload.tracks}
     if len(files) != 2 or set(files) != expected_fields:

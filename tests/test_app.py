@@ -7,10 +7,11 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from l0_draft_engine.app import create_app
 from l0_draft_engine.config import Settings
-from l0_draft_engine.schemas import DraftResponse, DraftRow
+from l0_draft_engine.schemas import DraftPayload, DraftResponse, DraftRow, TrackSpec
 
 @pytest.fixture
 def anyio_backend() -> str:
@@ -73,6 +74,39 @@ def payload(tracks: int = 2) -> str:
         {"lane": "speaker-2", "fieldName": "audio:2"},
     ][:tracks]
     return json.dumps({"taskId": "task-1", "tracks": values})
+
+
+def test_track_lanes_accept_human_and_cyrillic_labels() -> None:
+    draft_payload = DraftPayload.model_validate(
+        {
+            "taskId": "task-1",
+            "tracks": [
+                {"lane": "Speaker 1", "fieldName": "audio:1"},
+                {"lane": "Говорящий 2", "fieldName": "audio:2"},
+            ],
+        }
+    )
+
+    assert [track.lane for track in draft_payload.tracks] == [
+        "Speaker 1",
+        "Говорящий 2",
+    ]
+
+
+def test_track_field_name_remains_a_safe_multipart_identifier() -> None:
+    with pytest.raises(ValidationError, match="must contain only letters"):
+        TrackSpec.model_validate({"lane": "Speaker 1", "fieldName": "audio field"})
+
+
+@pytest.mark.parametrize("lane", ["Speaker\n1", "Говорящий\u007f2"])
+def test_track_lane_rejects_control_characters(lane: str) -> None:
+    with pytest.raises(ValidationError, match="must not contain control characters"):
+        TrackSpec.model_validate({"lane": lane, "fieldName": "audio:1"})
+
+
+def test_track_lane_preserves_length_limit() -> None:
+    with pytest.raises(ValidationError):
+        TrackSpec.model_validate({"lane": "С" * 129, "fieldName": "audio:1"})
 
 
 @pytest.mark.anyio
@@ -154,6 +188,43 @@ async def test_draft_rejects_any_count_other_than_two_tracks() -> None:
             headers=PROXY_HEADERS,
         )
     assert response.status_code == 422
+    assert engine.draft_calls == 0
+
+
+@pytest.mark.anyio
+async def test_invalid_payload_returns_a_json_serializable_422() -> None:
+    settings = Settings()
+    engine = FakeEngine()
+    app = create_app(settings, engine)  # type: ignore[arg-type]
+    invalid_payload = json.dumps(
+        {
+            "taskId": "task-1",
+            "tracks": [
+                {"lane": "Speaker\n1", "fieldName": "audio:1"},
+                {"lane": "Говорящий 2", "fieldName": "audio:2"},
+            ],
+        }
+    )
+    files = {
+        "audio:1": ("first.wav", wav_bytes(), "audio/wav"),
+        "audio:2": ("second.wav", wav_bytes(), "audio/wav"),
+    }
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        response = await client.post(
+            "/v1/draft",
+            data={"payload": invalid_payload},
+            files=files,
+            headers=PROXY_HEADERS,
+        )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["tracks", 0, "lane"]
+    assert "ctx" not in detail[0]
+    json.dumps(detail)
     assert engine.draft_calls == 0
 
 
