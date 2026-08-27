@@ -7,7 +7,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/cache/huggingface \
     TMPDIR=/var/tmp/l0-draft
 
-RUN apt-get update \
+RUN mkdir -p /var/tmp/l0-draft \
+    && apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates ffmpeg libsndfile1 python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
