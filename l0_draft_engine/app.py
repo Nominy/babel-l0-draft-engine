@@ -21,7 +21,7 @@ from .schemas import DraftPayload, DraftResponse
 
 
 COPY_CHUNK_BYTES = 1024 * 1024
-LOCAL_ORIGIN_RE = r"^https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?$"
+ALLOWED_ORIGIN_RE = r"^(?:https://dashboard\.babel\.audio|https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?)$"
 
 class RequestBodyTooLarge(Exception):
     pass
@@ -164,7 +164,7 @@ def create_app(
     )
     service.add_middleware(
         CORSMiddleware,
-        allow_origin_regex=LOCAL_ORIGIN_RE,
+        allow_origin_regex=ALLOWED_ORIGIN_RE,
         allow_credentials=False,
         allow_methods=["GET", "POST"],
         allow_headers=["Content-Type", "X-Babel-Local-Engine"],

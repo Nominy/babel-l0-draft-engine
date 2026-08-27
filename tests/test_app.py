@@ -243,13 +243,17 @@ async def test_draft_requires_proxy_header_and_rejects_busy_requests() -> None:
 
 
 @pytest.mark.anyio
-async def test_cors_allows_only_loopback_web_origins() -> None:
+async def test_cors_allows_dashboard_and_loopback_origins_only() -> None:
     settings = Settings()
     app = create_app(settings, FakeEngine())  # type: ignore[arg-type]
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
+        dashboard = await client.get(
+            "/health", headers={"Origin": "https://dashboard.babel.audio"}
+        )
         local = await client.get("/health", headers={"Origin": "http://localhost:3000"})
         remote = await client.get("/health", headers={"Origin": "https://example.com"})
+    assert dashboard.headers["access-control-allow-origin"] == "https://dashboard.babel.audio"
     assert local.headers["access-control-allow-origin"] == "http://localhost:3000"
     assert "access-control-allow-origin" not in remote.headers
