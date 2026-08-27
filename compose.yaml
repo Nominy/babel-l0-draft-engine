@@ -1,0 +1,32 @@
+services:
+  l0-draft-engine:
+    build: .
+    ports:
+      - "127.0.0.1:8767:8767"
+    environment:
+      LOCAL_ENGINE_DEVICE: cuda
+      LOCAL_ENGINE_GIGAAM_MODEL: ${LOCAL_ENGINE_GIGAAM_MODEL:-v3_ctc}
+      LOCAL_ENGINE_PUNCTUATION_MODEL: ${LOCAL_ENGINE_PUNCTUATION_MODEL:-kontur-ai/sbert_punc_case_ru}
+      LOCAL_ENGINE_PREPROCESSING: ${LOCAL_ENGINE_PREPROCESSING:-raw}
+    volumes:
+      - ./models:/models:ro
+      - model-cache:/cache
+      - uploads:/var/tmp/l0-draft
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-m", "l0_draft_engine.healthcheck"]
+      interval: 15s
+      timeout: 6s
+      retries: 4
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  model-cache:
+  uploads:
