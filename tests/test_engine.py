@@ -120,7 +120,7 @@ def test_full_lane_asr_s2_grouping_mgm_prior_and_stable_rows() -> None:
     assert all(row.endSeconds > row.startSeconds for row in first.rows)
     assert next(row.text for row in first.rows if row.lane == "speaker-1") == "Мгм."
     assert first.summary["rowCount"] == 2
-    assert first.models["asr"]["name"] == "gigaam-v3-ctc-domain"
+    assert first.models["asr"]["name"] == "v3_ctc"
     assert len(asr.calls) == 4
     for path, kwargs in asr.calls:
         assert path.endswith("-full.wav")
