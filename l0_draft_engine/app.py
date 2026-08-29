@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 import json
+import re
 import tempfile
+import uuid
 import wave
 from pathlib import Path
 from typing import Any
@@ -19,11 +21,45 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Settings
 from .engine import DraftEngine, DraftInputError, ModelUnavailableError
+from .inference_queue import DuplicateRequestIdError, InferenceQueue
 from .schemas import DraftPayload, DraftResponse, TranscriptionResponse
 
 
 COPY_CHUNK_BYTES = 1024 * 1024
 ALLOWED_ORIGIN_RE = r"^(?:https://dashboard\.babel\.audio|https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?)$"
+REQUEST_ID_MAX_LENGTH = 128
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+
+
+def _request_id(request: Request) -> str:
+    if "x-babel-request-id" not in request.headers:
+        return str(uuid.uuid4())
+    request_id = request.headers["x-babel-request-id"]
+    if (
+        not request_id
+        or len(request_id) > REQUEST_ID_MAX_LENGTH
+        or REQUEST_ID_RE.fullmatch(request_id) is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="X-Babel-Request-Id must be a nonempty safe identifier of at most 128 characters",
+        )
+    return request_id
+
+
+async def _finish_cancelled_worker(task: asyncio.Task[Any]) -> None:
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+        except BaseException:
+            break
+    if task.done() and not task.cancelled():
+        try:
+            task.result()
+        except BaseException:
+            pass
 
 class RequestBodyTooLarge(Exception):
     pass
@@ -164,7 +200,7 @@ def create_app(
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     resolved_engine = engine or DraftEngine(resolved_settings)
-    inference_lock = asyncio.Lock()
+    inference_queue = InferenceQueue()
     service = FastAPI(title="Babel Local Drafting Engine", version="1.0.0")
     service.add_middleware(
         RequestSizeLimitMiddleware, max_bytes=resolved_settings.max_request_bytes
@@ -174,15 +210,27 @@ def create_app(
         allow_origin_regex=ALLOWED_ORIGIN_RE,
         allow_credentials=False,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "X-Babel-Local-Engine"],
+        allow_headers=[
+            "Content-Type",
+            "X-Babel-Local-Engine",
+            "X-Babel-Request-Id",
+        ],
         max_age=600,
     )
     service.state.settings = resolved_settings
     service.state.engine = resolved_engine
+    service.state.inference_queue = inference_queue
 
     @service.get("/health")
     def health() -> dict[str, object]:
         return resolved_engine.health()
+
+    @service.get("/v1/queue/{request_id}")
+    async def queue_status(request_id: str) -> dict[str, str | int]:
+        status = inference_queue.status(request_id)
+        if status is None:
+            raise HTTPException(status_code=404, detail="request ID not found")
+        return status.as_dict()
 
     async def run_inference(
         request: Request,
@@ -193,6 +241,7 @@ def create_app(
     ) -> DraftResponse | TranscriptionResponse:
         if request.headers.get("x-babel-local-engine") != "1":
             raise HTTPException(status_code=403, detail="local proxy header is required")
+        request_id = _request_id(request)
         content_length = _content_length(request)
         if (
             content_length is not None
@@ -233,13 +282,39 @@ def create_app(
                         destination, resolved_settings.max_audio_seconds
                     )
                     paths[track.lane] = destination
+
                 try:
-                    async with inference_lock:
-                        return await run_in_threadpool(inference, payload, paths)
+                    ticket = inference_queue.register(request_id)
+                except DuplicateRequestIdError as exc:
+                    raise HTTPException(
+                        status_code=409, detail="request ID is already registered"
+                    ) from exc
+                try:
+                    await ticket.ready.wait()
+                except BaseException:
+                    inference_queue.abandon(ticket)
+                    raise
+
+                try:
+                    worker = asyncio.create_task(
+                        run_in_threadpool(inference, payload, paths)
+                    )
+                except BaseException:
+                    inference_queue.abandon(ticket)
+                    raise
+                try:
+                    try:
+                        return await asyncio.shield(worker)
+                    except asyncio.CancelledError as exc:
+                        await _finish_cancelled_worker(worker)
+                        raise exc
                 except DraftInputError as exc:
                     raise HTTPException(status_code=422, detail=str(exc)) from exc
                 except ModelUnavailableError as exc:
                     raise HTTPException(status_code=503, detail=str(exc)) from exc
+                finally:
+                    if worker.done():
+                        inference_queue.complete(ticket)
         finally:
             for upload in uploads:
                 await upload.close()

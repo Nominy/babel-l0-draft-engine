@@ -439,6 +439,66 @@ async def test_concurrent_draft_requests_wait_and_execute_one_at_a_time() -> Non
 
 
 @pytest.mark.anyio
+async def test_queue_status_reports_running_position_and_completion() -> None:
+    settings = Settings()
+    engine = FakeEngine(hold_first_draft=True)
+    app = create_app(settings, engine)  # type: ignore[arg-type]
+
+    async def post_draft(client: httpx.AsyncClient, request_id: str) -> httpx.Response:
+        return await client.post(
+            "/v1/draft",
+            data={"payload": payload()},
+            files={
+                "audio:1": ("first.wav", wav_bytes(), "audio/wav"),
+                "audio:2": ("second.wav", wav_bytes(), "audio/wav"),
+            },
+            headers={**PROXY_HEADERS, "X-Babel-Request-Id": request_id},
+        )
+
+    async def wait_for_status(
+        client: httpx.AsyncClient, request_id: str
+    ) -> httpx.Response:
+        for _ in range(100):
+            response = await client.get(f"/v1/queue/{request_id}")
+            if response.status_code == 200:
+                return response
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"queue status never appeared for {request_id}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        first_task = asyncio.create_task(post_draft(client, "first-request"))
+        assert await asyncio.to_thread(engine.first_draft_started.wait, 2)
+        second_task = asyncio.create_task(post_draft(client, "second-request"))
+        second_status = await wait_for_status(client, "second-request")
+        first_status = await wait_for_status(client, "first-request")
+
+        assert first_status.json() == {
+            "requestId": "first-request",
+            "status": "running",
+            "position": 0,
+            "queuedCount": 1,
+        }
+        assert second_status.json() == {
+            "requestId": "second-request",
+            "status": "queued",
+            "position": 1,
+            "queuedCount": 1,
+        }
+        assert (await client.get("/v1/queue/unknown")).status_code == 404
+
+        engine.release_first_draft.set()
+        first_response, second_response = await asyncio.gather(
+            first_task, second_task
+        )
+        assert first_response.status_code == 200
+        assert second_response.status_code == 200
+        assert (await client.get("/v1/queue/first-request")).json()["status"] == "completed"
+        assert (await client.get("/v1/queue/second-request")).json()["status"] == "completed"
+
+
+@pytest.mark.anyio
 async def test_draft_and_transcribe_share_one_inference_queue() -> None:
     settings = Settings()
     engine = FakeEngine(hold_first_draft=True)

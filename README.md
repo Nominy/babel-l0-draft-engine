@@ -21,6 +21,8 @@ The service is published only at `127.0.0.1:8767`. Check it with `docker compose
 
 `POST /v1/transcribe` accepts the same multipart request and returns ordered ASR word tokens with absolute `startSeconds` and `endSeconds` values for each lane. It does not run or load the punctuation model; silent lanes return an empty token list.
 
+Clients may send `X-Babel-Request-Id` with either inference request and poll `GET /v1/queue/{requestId}`. The status response distinguishes `queued` requests with a one-based `position`, the active `running` request, and recently `completed` requests. Drafting and transcription share the same FIFO GPU queue.
+
 ## Self-host on Windows
 
 Install 64-bit Python 3.11 and a current NVIDIA driver. From PowerShell:
