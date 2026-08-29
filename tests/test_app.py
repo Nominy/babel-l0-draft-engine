@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import threading
 import wave
 from pathlib import Path
 
@@ -11,7 +13,15 @@ from pydantic import ValidationError
 
 from l0_draft_engine.app import create_app
 from l0_draft_engine.config import Settings
-from l0_draft_engine.schemas import DraftPayload, DraftResponse, DraftRow, TrackSpec
+from l0_draft_engine.schemas import (
+    DraftPayload,
+    DraftResponse,
+    DraftRow,
+    TrackSpec,
+    TranscriptionResponse,
+    TranscriptionToken,
+    TranscriptionTrack,
+)
 
 @pytest.fixture
 def anyio_backend() -> str:
@@ -31,41 +41,83 @@ def wav_bytes(channels: int = 1, frames: int = 1600) -> bytes:
 
 
 class FakeEngine:
-    def __init__(self) -> None:
+    def __init__(self, *, hold_first_draft: bool = False) -> None:
         self.draft_calls = 0
+        self.transcribe_calls = 0
         self.paths: list[Path] = []
-        self.busy = False
-
-    def try_admit(self) -> bool:
-        if self.busy:
-            return False
-        self.busy = True
-        return True
-
-    def release_admission(self) -> None:
-        self.busy = False
+        self.active_drafts = 0
+        self.max_active_drafts = 0
+        self.first_draft_started = threading.Event()
+        self.release_first_draft = threading.Event()
+        self._draft_state_lock = threading.Lock()
+        if not hold_first_draft:
+            self.release_first_draft.set()
 
     def health(self) -> dict[str, object]:
         return {"ok": True, "device": "cuda", "models": {"loaded": False}}
 
     def draft(self, payload, paths) -> DraftResponse:
-        self.draft_calls += 1
-        self.paths = list(paths.values())
-        assert set(paths) == {"speaker-1", "speaker-2"}
-        assert all(path.is_file() for path in paths.values())
-        return DraftResponse(
-            rows=[
-                DraftRow(
-                    id="aab3266d-21b8-5082-814d-b2a5df1e15be",
-                    lane="speaker-1",
-                    startSeconds=0.0,
-                    endSeconds=0.1,
-                    text="Мгм.",
-                )
-            ],
-            summary={"rowCount": 1},
-            models={"asr": "mock"},
-        )
+        with self._draft_state_lock:
+            self.draft_calls += 1
+            call_number = self.draft_calls
+            self.active_drafts += 1
+            self.max_active_drafts = max(self.max_active_drafts, self.active_drafts)
+        try:
+            self.paths = list(paths.values())
+            assert set(paths) == {"speaker-1", "speaker-2"}
+            assert all(path.is_file() for path in paths.values())
+            if call_number == 1:
+                self.first_draft_started.set()
+                if not self.release_first_draft.wait(timeout=5):
+                    raise TimeoutError("test did not release the first draft")
+            return DraftResponse(
+                rows=[
+                    DraftRow(
+                        id="aab3266d-21b8-5082-814d-b2a5df1e15be",
+                        lane="speaker-1",
+                        startSeconds=0.0,
+                        endSeconds=0.1,
+                        text="Мгм.",
+                    )
+                ],
+                summary={"rowCount": 1},
+                models={"asr": "mock"},
+            )
+        finally:
+            with self._draft_state_lock:
+                self.active_drafts -= 1
+
+    def transcribe(self, payload, paths) -> TranscriptionResponse:
+        with self._draft_state_lock:
+            self.transcribe_calls += 1
+            self.active_drafts += 1
+            self.max_active_drafts = max(self.max_active_drafts, self.active_drafts)
+        try:
+            self.paths = list(paths.values())
+            assert set(paths) == {"speaker-1", "speaker-2"}
+            assert all(path.is_file() for path in paths.values())
+            return TranscriptionResponse(
+                taskId=payload.taskId,
+                tracks=[
+                    TranscriptionTrack(
+                        lane="speaker-1",
+                        tokens=[
+                            TranscriptionToken(
+                                id="timing-1",
+                                text="Привет",
+                                startSeconds=0.01,
+                                endSeconds=0.08,
+                            )
+                        ],
+                    ),
+                    TranscriptionTrack(lane="speaker-2", tokens=[]),
+                ],
+                summary={"trackCount": 2, "tokenCount": 1},
+                models={"asr": "mock"},
+            )
+        finally:
+            with self._draft_state_lock:
+                self.active_drafts -= 1
 
 
 def payload(tracks: int = 2) -> str:
@@ -170,6 +222,45 @@ async def test_draft_accepts_declared_colon_fields_and_cleans_temp_files() -> No
     assert response.status_code == 200, response.text
     assert response.json()["rows"][0]["endSeconds"] > response.json()["rows"][0]["startSeconds"]
     assert engine.draft_calls == 1
+    assert engine.paths and all(not path.exists() for path in engine.paths)
+
+
+@pytest.mark.anyio
+async def test_transcribe_uses_draft_multipart_contract_and_cleans_temp_files() -> None:
+    settings = Settings()
+    engine = FakeEngine()
+    app = create_app(settings, engine)  # type: ignore[arg-type]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        response = await client.post(
+            "/v1/transcribe",
+            data={"payload": payload()},
+            files={
+                "audio:1": ("first.wav", wav_bytes(), "audio/wav"),
+                "audio:2": ("second.wav", wav_bytes(), "audio/wav"),
+            },
+            headers=PROXY_HEADERS,
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert set(body) == {"taskId", "tracks", "summary", "models"}
+    assert body["taskId"] == "task-1"
+    assert [track["lane"] for track in body["tracks"]] == [
+        "speaker-1",
+        "speaker-2",
+    ]
+    assert body["tracks"][0]["tokens"] == [
+        {
+            "id": "timing-1",
+            "text": "Привет",
+            "startSeconds": 0.01,
+            "endSeconds": 0.08,
+        }
+    ]
+    assert body["tracks"][1]["tokens"] == []
+    assert engine.transcribe_calls == 1
     assert engine.paths and all(not path.exists() for path in engine.paths)
 
 
@@ -297,7 +388,7 @@ async def test_chunked_request_body_limit_cannot_be_bypassed() -> None:
 
 
 @pytest.mark.anyio
-async def test_draft_requires_proxy_header_and_rejects_busy_requests() -> None:
+async def test_draft_requires_proxy_header() -> None:
     settings = Settings()
     engine = FakeEngine()
     app = create_app(settings, engine)  # type: ignore[arg-type]
@@ -305,12 +396,90 @@ async def test_draft_requires_proxy_header_and_rejects_busy_requests() -> None:
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
         forbidden = await client.post("/v1/draft", content=b"")
-        engine.busy = True
-        busy = await client.post("/v1/draft", content=b"", headers=PROXY_HEADERS)
     assert forbidden.status_code == 403
-    assert busy.status_code == 429
-    assert busy.headers["retry-after"] == "1"
     assert engine.draft_calls == 0
+
+
+@pytest.mark.anyio
+async def test_concurrent_draft_requests_wait_and_execute_one_at_a_time() -> None:
+    settings = Settings()
+    engine = FakeEngine(hold_first_draft=True)
+    app = create_app(settings, engine)  # type: ignore[arg-type]
+
+    async def post_draft(client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            "/v1/draft",
+            data={"payload": payload()},
+            files={
+                "audio:1": ("first.wav", wav_bytes(), "audio/wav"),
+                "audio:2": ("second.wav", wav_bytes(), "audio/wav"),
+            },
+            headers=PROXY_HEADERS,
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        first_request = asyncio.create_task(post_draft(client))
+        assert await asyncio.to_thread(engine.first_draft_started.wait, 2)
+        second_request = asyncio.create_task(post_draft(client))
+        await asyncio.sleep(0)
+        try:
+            assert not second_request.done()
+            assert engine.draft_calls == 1
+            assert engine.max_active_drafts == 1
+        finally:
+            engine.release_first_draft.set()
+        first, second = await asyncio.gather(first_request, second_request)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert engine.draft_calls == 2
+    assert engine.max_active_drafts == 1
+
+
+@pytest.mark.anyio
+async def test_draft_and_transcribe_share_one_inference_queue() -> None:
+    settings = Settings()
+    engine = FakeEngine(hold_first_draft=True)
+    app = create_app(settings, engine)  # type: ignore[arg-type]
+
+    async def post(client: httpx.AsyncClient, endpoint: str) -> httpx.Response:
+        return await client.post(
+            endpoint,
+            data={"payload": payload()},
+            files={
+                "audio:1": ("first.wav", wav_bytes(), "audio/wav"),
+                "audio:2": ("second.wav", wav_bytes(), "audio/wav"),
+            },
+            headers=PROXY_HEADERS,
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        draft_request = asyncio.create_task(post(client, "/v1/draft"))
+        assert await asyncio.to_thread(engine.first_draft_started.wait, 2)
+        transcription_request = asyncio.create_task(
+            post(client, "/v1/transcribe")
+        )
+        await asyncio.sleep(0)
+        try:
+            assert not transcription_request.done()
+            assert engine.draft_calls == 1
+            assert engine.transcribe_calls == 0
+            assert engine.max_active_drafts == 1
+        finally:
+            engine.release_first_draft.set()
+        draft_response, transcription_response = await asyncio.gather(
+            draft_request, transcription_request
+        )
+
+    assert draft_response.status_code == 200, draft_response.text
+    assert transcription_response.status_code == 200, transcription_response.text
+    assert engine.draft_calls == 1
+    assert engine.transcribe_calls == 1
+    assert engine.max_active_drafts == 1
 
 
 @pytest.mark.anyio

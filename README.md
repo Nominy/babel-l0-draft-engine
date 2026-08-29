@@ -1,6 +1,6 @@
 # L0 Draft Engine
 
-Private two-track drafting service with the existing `POST /v1/draft` multipart contract and `GET /health` endpoint.
+Private two-track drafting and timestamp transcription service with `POST /v1/draft`, `POST /v1/transcribe`, and `GET /health` endpoints.
 
 ## Self-host on Linux
 
@@ -18,6 +18,8 @@ The first draft downloads the original public models and stores them in the pers
 The service is published only at `127.0.0.1:8767`. Check it with `docker compose ps` or `curl --fail http://127.0.0.1:8767/health`.
 
 `POST /v1/draft` accepts one `payload` JSON multipart field plus exactly the two mono WAV fields declared by `payload.tracks`; callers must send `X-Babel-Local-Engine: 1`. Responses retain the canonical ordered draft-row schema.
+
+`POST /v1/transcribe` accepts the same multipart request and returns ordered ASR word tokens with absolute `startSeconds` and `endSeconds` values for each lane. It does not run or load the punctuation model; silent lanes return an empty token list.
 
 ## Self-host on Windows
 

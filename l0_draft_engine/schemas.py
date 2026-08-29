@@ -132,3 +132,36 @@ class DraftResponse(BaseModel):
     rows: list[DraftRow] = Field(min_length=1)
     summary: dict[str, object]
     models: dict[str, object]
+
+
+class TranscriptionToken(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    id: str
+    text: str = Field(min_length=1)
+    startSeconds: float = Field(ge=0)
+    endSeconds: float = Field(gt=0)
+
+    @model_validator(mode="after")
+    def positive_interval(self) -> "TranscriptionToken":
+        if not math.isfinite(self.startSeconds) or not math.isfinite(self.endSeconds):
+            raise ValueError("token timestamps must be finite")
+        if self.endSeconds <= self.startSeconds:
+            raise ValueError("token duration must be positive")
+        return self
+
+
+class TranscriptionTrack(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lane: str
+    tokens: list[TranscriptionToken]
+
+
+class TranscriptionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    taskId: str
+    tracks: list[TranscriptionTrack] = Field(min_length=2, max_length=2)
+    summary: dict[str, object]
+    models: dict[str, object]

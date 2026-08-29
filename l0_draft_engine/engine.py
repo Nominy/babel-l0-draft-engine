@@ -26,9 +26,17 @@ from .pipeline import (
 from .config import Settings
 from .gigaam_asr import GigaAMRecognizer
 from .l2 import PunctuationFormatter
-from .schemas import DraftPayload, DraftResponse, DraftRow
+from .schemas import (
+    DraftPayload,
+    DraftResponse,
+    DraftRow,
+    TranscriptionResponse,
+    TranscriptionToken,
+    TranscriptionTrack,
+)
 
 ROW_NAMESPACE = uuid.UUID("54057e89-dfb6-5f31-925d-6119e48bdac4")
+TOKEN_NAMESPACE = uuid.UUID("a7517066-1d3b-52f5-a6f9-6a38a59ffde7")
 MARKUP_RE = re.compile(r"\[[^\[\]\r\n]+\]|</?[^<>\r\n]+>|\{[^{}\r\n]+\}")
 EDGE_PUNCTUATION_RE = re.compile(r'^["«»„“”(),.!?;:…]+|["«»„“”(),.!?;:…]+$')
 
@@ -76,13 +84,6 @@ class DraftEngine:
         self._asr: Any | None = None
         self._formatter: Any | None = None
         self._gpu_lock = threading.Lock()
-        self._admission = threading.BoundedSemaphore(1)
-
-    def try_admit(self) -> bool:
-        return self._admission.acquire(blocking=False)
-
-    def release_admission(self) -> None:
-        self._admission.release()
 
     def _load_asr(self) -> Any:
         try:
@@ -348,7 +349,7 @@ class DraftEngine:
             lane = track_spec.lane
             lane_words = words_by_lane[lane]
             if not lane_words:
-                raise DraftInputError(f"ASR produced no words for lane {lane}")
+                continue
             midpoints = midpoints_by_lane[lane]
             lane_candidates: list[RowCandidate] = []
             for segment in coarse_by_lane[lane]:
@@ -409,8 +410,17 @@ class DraftEngine:
                 formatted[candidate.segment.id] = str(text).strip()
         return formatted
 
-    def draft(self, payload: DraftPayload, audio_paths: dict[str, Path]) -> DraftResponse:
-        started = time.perf_counter()
+    def _prepare_audio(
+        self,
+        payload: DraftPayload,
+        audio_paths: dict[str, Path],
+    ) -> tuple[
+        str,
+        list[str],
+        dict[str, AudioTrack],
+        dict[str, Sequence[Segment]],
+        dict[str, dict[str, float]],
+    ]:
         expected_lanes = [track.lane for track in payload.tracks]
         if set(audio_paths) != set(expected_lanes) or len(audio_paths) != 2:
             raise DraftInputError("audio paths must match exactly two payload lanes")
@@ -425,7 +435,9 @@ class DraftEngine:
         diagnostics: dict[str, dict[str, float]] = {}
         try:
             for lane in expected_lanes:
-                track, pcm = prepare_track(lane, audio_paths[lane], workspace, preprocessing)
+                track, pcm = prepare_track(
+                    lane, audio_paths[lane], workspace, preprocessing
+                )
                 if preprocessing == "afftdn":
                     segmentation_pcm = pcm
                 else:
@@ -435,8 +447,6 @@ class DraftEngine:
                 coarse, _, lane_diagnostics = segment_track(
                     track, segmentation_pcm, self.settings.segmentation
                 )
-                if not coarse:
-                    raise DraftInputError(f"segmentation produced no S2 rows for lane {lane}")
                 tracks[lane] = track
                 coarse_by_lane[lane] = coarse
                 diagnostics[lane] = lane_diagnostics
@@ -445,6 +455,95 @@ class DraftEngine:
             raise
         except L0EngineError as exc:
             raise DraftInputError(str(exc)) from exc
+        return preprocessing, expected_lanes, tracks, coarse_by_lane, diagnostics
+
+    def transcribe(
+        self, payload: DraftPayload, audio_paths: dict[str, Path]
+    ) -> TranscriptionResponse:
+        started = time.perf_counter()
+        (
+            preprocessing,
+            expected_lanes,
+            tracks,
+            coarse_by_lane,
+            diagnostics,
+        ) = self._prepare_audio(payload, audio_paths)
+        preprocess_finished = time.perf_counter()
+
+        wait_started = time.perf_counter()
+        with self._gpu_lock:
+            inference_started = time.perf_counter()
+            model = self._get_asr()
+            words_by_lane = {
+                lane: self._transcribe_lane(
+                    model, tracks[lane], coarse_by_lane[lane]
+                )
+                for lane in expected_lanes
+            }
+            asr_finished = time.perf_counter()
+
+        response_tracks: list[TranscriptionTrack] = []
+        for lane in expected_lanes:
+            track = tracks[lane]
+            lane_words = sorted(
+                words_by_lane[lane],
+                key=lambda word: (word.start, word.end, word.surface),
+            )
+            tokens = [
+                TranscriptionToken(
+                    id=str(
+                        uuid.uuid5(
+                            TOKEN_NAMESPACE,
+                            "|".join(
+                                (
+                                    payload.taskId,
+                                    lane,
+                                    track.pcm_sha256,
+                                    str(token_index),
+                                    word.start.hex(),
+                                    word.end.hex(),
+                                    word.surface,
+                                )
+                            ),
+                        )
+                    ),
+                    text=word.surface,
+                    startSeconds=word.start,
+                    endSeconds=word.end,
+                )
+                for token_index, word in enumerate(lane_words)
+            ]
+            response_tracks.append(TranscriptionTrack(lane=lane, tokens=tokens))
+
+        finished = time.perf_counter()
+        return TranscriptionResponse(
+            taskId=payload.taskId,
+            tracks=response_tracks,
+            summary={
+                "taskId": payload.taskId,
+                "trackCount": len(response_tracks),
+                "tokenCount": sum(len(track.tokens) for track in response_tracks),
+                "preprocessing": preprocessing,
+                "latencyMs": {
+                    "preparation": round((preprocess_finished - started) * 1000),
+                    "gpuQueue": round((inference_started - wait_started) * 1000),
+                    "asr": round((asr_finished - inference_started) * 1000),
+                    "total": round((finished - started) * 1000),
+                },
+                "segmentation": diagnostics,
+            },
+            models={"asr": self.model_summary()["asr"]},
+        )
+
+    def draft(self, payload: DraftPayload, audio_paths: dict[str, Path]) -> DraftResponse:
+        started = time.perf_counter()
+        (
+            preprocessing,
+            expected_lanes,
+            tracks,
+            coarse_by_lane,
+            diagnostics,
+        ) = self._prepare_audio(payload, audio_paths)
         preprocess_finished = time.perf_counter()
 
         wait_started = time.perf_counter()

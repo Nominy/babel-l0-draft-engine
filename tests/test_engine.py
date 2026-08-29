@@ -157,6 +157,33 @@ def test_s2_segment_asr_grouping_mgm_prior_and_stable_rows() -> None:
     assert formatter.calls[0][0] == ("Мгм",)
 
 
+def test_silent_lane_is_omitted_from_replacement_rows() -> None:
+    asr = FakeASR()
+    formatter = FakeFormatter()
+    engine = DraftEngine(
+        Settings(preprocessing="raw"),
+        asr_factory=lambda: asr,
+        formatter_factory=lambda: formatter,
+    )
+
+    def segment_only_speaker(track: AudioTrack, pcm: bytes, config):
+        if track.lane == "speaker-2":
+            return [], [], {"coarse_segments": 0.0, "active_fraction": 0.0}
+        return fake_segment(track, pcm, config)
+
+    with tempfile.TemporaryDirectory() as temporary, patch(
+        "l0_draft_engine.engine.prepare_track", side_effect=fake_prepare
+    ), patch(
+        "l0_draft_engine.engine.segment_track", side_effect=segment_only_speaker
+    ):
+        response = engine.draft(draft_payload(), audio_paths(Path(temporary)))
+
+    assert [row.lane for row in response.rows] == ["speaker-1"]
+    assert response.summary["rowCount"] == 1
+    assert response.summary["segmentation"]["speaker-2"]["coarse_segments"] == 0.0
+    assert len(asr.calls) == 1
+
+
 def test_s2_range_is_the_model_input_and_one_babel_row() -> None:
     asr = SpacedWordASR()
     formatter = FakeFormatter()
@@ -327,4 +354,113 @@ def test_gpu_inference_is_serialized_across_requests() -> None:
             ]
             responses = [future.result() for future in futures]
     assert all(len(response.rows) == 2 for response in responses)
+    assert asr.max_active == 1
+
+
+def test_transcribe_returns_stable_ordered_word_timing_without_formatter() -> None:
+    asr = FakeASR()
+    formatter_factory_calls = 0
+
+    def forbidden_formatter():
+        nonlocal formatter_factory_calls
+        formatter_factory_calls += 1
+        raise AssertionError("transcription must not initialize punctuation")
+
+    engine = DraftEngine(
+        Settings(preprocessing="raw"),
+        asr_factory=lambda: asr,
+        formatter_factory=forbidden_formatter,
+    )
+    with tempfile.TemporaryDirectory() as temporary, patch(
+        "l0_draft_engine.engine.prepare_track", side_effect=fake_prepare
+    ), patch("l0_draft_engine.engine.segment_track", side_effect=fake_segment):
+        paths = audio_paths(Path(temporary))
+        first = engine.transcribe(draft_payload(), paths)
+        second = engine.transcribe(draft_payload(), paths)
+
+    assert first.taskId == "task-1"
+    assert [track.lane for track in first.tracks] == ["speaker-1", "speaker-2"]
+    assert [
+        [(token.text, token.startSeconds, token.endSeconds) for token in track.tokens]
+        for track in first.tracks
+    ] == [
+        [("Мгм", 0.5, 0.8)],
+        [("Привет", 0.5, 0.8)],
+    ]
+    assert [
+        [token.id for token in track.tokens] for track in first.tracks
+    ] == [
+        [token.id for token in track.tokens] for track in second.tracks
+    ]
+    assert all(
+        uuid.UUID(token.id).version == 5
+        and token.startSeconds >= 0
+        and token.endSeconds > token.startSeconds
+        for track in first.tracks
+        for token in track.tokens
+    )
+    assert first.summary["tokenCount"] == 2
+    assert set(first.models) == {"asr"}
+    assert formatter_factory_calls == 0
+
+
+def test_transcribe_keeps_silent_and_fully_empty_lanes_as_empty_tracks() -> None:
+    for silent_lanes in ({"speaker-2"}, {"speaker-1", "speaker-2"}):
+        asr = FakeASR()
+
+        def segment_with_silence(track: AudioTrack, pcm: bytes, config):
+            if track.lane in silent_lanes:
+                return [], [], {"coarse_segments": 0.0, "active_fraction": 0.0}
+            return fake_segment(track, pcm, config)
+
+        engine = DraftEngine(
+            Settings(preprocessing="raw"),
+            asr_factory=lambda: asr,
+            formatter_factory=lambda: (_ for _ in ()).throw(
+                AssertionError("transcription must not initialize punctuation")
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "l0_draft_engine.engine.prepare_track", side_effect=fake_prepare
+        ), patch(
+            "l0_draft_engine.engine.segment_track", side_effect=segment_with_silence
+        ):
+            response = engine.transcribe(
+                draft_payload(), audio_paths(Path(temporary))
+            )
+
+        tokens_by_lane = {track.lane: track.tokens for track in response.tracks}
+        assert all(tokens_by_lane[lane] == [] for lane in silent_lanes)
+        assert response.summary["tokenCount"] == 2 - len(silent_lanes)
+
+
+def test_gpu_inference_is_serialized_across_draft_and_transcribe() -> None:
+    asr = FakeASR(delay=0.03)
+    engine = DraftEngine(
+        Settings(preprocessing="raw"),
+        asr_factory=lambda: asr,
+        formatter_factory=FakeFormatter,
+    )
+    with tempfile.TemporaryDirectory() as temporary, patch(
+        "l0_draft_engine.engine.prepare_track", side_effect=fake_prepare
+    ), patch("l0_draft_engine.engine.segment_track", side_effect=fake_segment):
+        root = Path(temporary)
+        first_directory = root / "draft"
+        second_directory = root / "transcribe"
+        first_directory.mkdir()
+        second_directory.mkdir()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            draft_future = pool.submit(
+                engine.draft, draft_payload("draft-task"), audio_paths(first_directory)
+            )
+            transcribe_future = pool.submit(
+                engine.transcribe,
+                draft_payload("transcribe-task"),
+                audio_paths(second_directory),
+            )
+            draft_response = draft_future.result()
+            transcribe_response = transcribe_future.result()
+
+    assert len(draft_response.rows) == 2
+    assert sum(len(track.tokens) for track in transcribe_response.tracks) == 2
     assert asr.max_active == 1

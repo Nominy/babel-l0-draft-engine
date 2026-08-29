@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 import json
 import tempfile
 import wave
@@ -17,7 +19,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Settings
 from .engine import DraftEngine, DraftInputError, ModelUnavailableError
-from .schemas import DraftPayload, DraftResponse
+from .schemas import DraftPayload, DraftResponse, TranscriptionResponse
 
 
 COPY_CHUNK_BYTES = 1024 * 1024
@@ -162,6 +164,7 @@ def create_app(
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     resolved_engine = engine or DraftEngine(resolved_settings)
+    inference_lock = asyncio.Lock()
     service = FastAPI(title="Babel Local Drafting Engine", version="1.0.0")
     service.add_middleware(
         RequestSizeLimitMiddleware, max_bytes=resolved_settings.max_request_bytes
@@ -181,70 +184,79 @@ def create_app(
     def health() -> dict[str, object]:
         return resolved_engine.health()
 
-    @service.post("/v1/draft", response_model=DraftResponse)
-    async def draft(request: Request) -> DraftResponse:
+    async def run_inference(
+        request: Request,
+        inference: Callable[
+            [DraftPayload, dict[str, Path]],
+            DraftResponse | TranscriptionResponse,
+        ],
+    ) -> DraftResponse | TranscriptionResponse:
         if request.headers.get("x-babel-local-engine") != "1":
             raise HTTPException(status_code=403, detail="local proxy header is required")
-        if not resolved_engine.try_admit():
-            raise HTTPException(
-                status_code=429,
-                detail="local inference engine is busy",
-                headers={"Retry-After": "1"},
-            )
+        content_length = _content_length(request)
+        if (
+            content_length is not None
+            and content_length > resolved_settings.max_request_bytes
+        ):
+            raise HTTPException(status_code=413, detail="request exceeds size limit")
         try:
-            content_length = _content_length(request)
-            if (
-                content_length is not None
-                and content_length > resolved_settings.max_request_bytes
-            ):
-                raise HTTPException(status_code=413, detail="request exceeds size limit")
-            try:
-                form = await request.form()
-            except RequestBodyTooLarge:
-                raise
-            except HTTPException:
-                raise
-            except Exception as exc:
-                raise HTTPException(status_code=400, detail="invalid multipart request") from exc
-            uploads = [
-                value
-                for _, value in form.multi_items()
-                if isinstance(value, StarletteUploadFile)
-            ]
-            try:
-                payload, files = _parse_form(form)
-                with tempfile.TemporaryDirectory(prefix="babel-local-engine-") as temporary:
-                    directory = Path(temporary)
-                    paths: dict[str, Path] = {}
-                    total_file_bytes = 0
-                    for index, track in enumerate(payload.tracks):
-                        destination = directory / f"track-{index}.wav"
-                        total_file_bytes += await _copy_upload(
-                            files[track.fieldName],
-                            destination,
-                            resolved_settings.max_track_bytes,
+            form = await request.form()
+        except RequestBodyTooLarge:
+            raise
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="invalid multipart request") from exc
+        uploads = [
+            value
+            for _, value in form.multi_items()
+            if isinstance(value, StarletteUploadFile)
+        ]
+        try:
+            payload, files = _parse_form(form)
+            with tempfile.TemporaryDirectory(prefix="babel-local-engine-") as temporary:
+                directory = Path(temporary)
+                paths: dict[str, Path] = {}
+                total_file_bytes = 0
+                for index, track in enumerate(payload.tracks):
+                    destination = directory / f"track-{index}.wav"
+                    total_file_bytes += await _copy_upload(
+                        files[track.fieldName],
+                        destination,
+                        resolved_settings.max_track_bytes,
+                    )
+                    if total_file_bytes > resolved_settings.max_request_bytes:
+                        raise HTTPException(
+                            status_code=413, detail="request exceeds size limit"
                         )
-                        if total_file_bytes > resolved_settings.max_request_bytes:
-                            raise HTTPException(
-                                status_code=413, detail="request exceeds size limit"
-                            )
-                        _validate_mono_wav(
-                            destination, resolved_settings.max_audio_seconds
-                        )
-                        paths[track.lane] = destination
-                    try:
-                        return await run_in_threadpool(
-                            resolved_engine.draft, payload, paths
-                        )
-                    except DraftInputError as exc:
-                        raise HTTPException(status_code=422, detail=str(exc)) from exc
-                    except ModelUnavailableError as exc:
-                        raise HTTPException(status_code=503, detail=str(exc)) from exc
-            finally:
-                for upload in uploads:
-                    await upload.close()
+                    _validate_mono_wav(
+                        destination, resolved_settings.max_audio_seconds
+                    )
+                    paths[track.lane] = destination
+                try:
+                    async with inference_lock:
+                        return await run_in_threadpool(inference, payload, paths)
+                except DraftInputError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                except ModelUnavailableError as exc:
+                    raise HTTPException(status_code=503, detail=str(exc)) from exc
         finally:
-            resolved_engine.release_admission()
+            for upload in uploads:
+                await upload.close()
+
+    @service.post("/v1/draft", response_model=DraftResponse)
+    async def draft(request: Request) -> DraftResponse:
+        response = await run_inference(request, resolved_engine.draft)
+        if not isinstance(response, DraftResponse):
+            raise RuntimeError("draft engine returned the wrong response type")
+        return response
+
+    @service.post("/v1/transcribe", response_model=TranscriptionResponse)
+    async def transcribe(request: Request) -> TranscriptionResponse:
+        response = await run_inference(request, resolved_engine.transcribe)
+        if not isinstance(response, TranscriptionResponse):
+            raise RuntimeError("transcription engine returned the wrong response type")
+        return response
 
     return service
 
