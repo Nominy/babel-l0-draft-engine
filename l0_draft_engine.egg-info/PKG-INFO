@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: l0-draft-engine
+Version: 1.0.0
+Summary: Private two-track L0 drafting engine
+Requires-Python: >=3.10
+Requires-Dist: fastapi<1,>=0.115
+Requires-Dist: uvicorn[standard]<1,>=0.30
+Requires-Dist: python-multipart<1,>=0.0.9
+Requires-Dist: gigaam[torch] @ https://github.com/salute-developers/GigaAM/archive/7447938d791c4f3e643386ee22c33777004293a5.zip
+Requires-Dist: transformers<6,>=4.48
+Requires-Dist: safetensors<1,>=0.4
+Requires-Dist: soundfile<1,>=0.12
+Requires-Dist: numpy<3,>=2
+Requires-Dist: audioop-lts>=0.2.1; python_version >= "3.13"

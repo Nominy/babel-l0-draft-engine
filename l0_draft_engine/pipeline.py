@@ -59,7 +59,6 @@ class SegmentationConfig:
     minimum_activity_ms: int = 120
     coarse_silence_ms: int = 1000
     coarse_padding_ms: int = 0
-    coarse_max_seconds: float = 45.0
     fine_silence_ms: int = 250
     fine_min_seconds: float = 2.5
     fine_target_seconds: float = 8.0
@@ -76,6 +75,15 @@ def _sha256_file(path: Path) -> str:
 
 def _run_ffmpeg(source: Path, destination: Path, mode: str, sample_rate: int = 16_000) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with wave.open(str(source), "rb") as audio:
+            target_frame_count = round(
+                audio.getnframes() * sample_rate / audio.getframerate()
+            )
+    except (OSError, EOFError, wave.Error) as exc:
+        raise EngineError(f"cannot inspect WAV duration for {source}: {exc}") from exc
+    if target_frame_count <= 0:
+        raise EngineError(f"cannot preprocess empty audio: {source}")
     temporary = destination.with_name(f"{destination.stem}.{os.getpid()}.tmp.wav")
     filters = ["highpass=f=45"]
     if mode == "afftdn":
@@ -83,6 +91,8 @@ def _run_ffmpeg(source: Path, destination: Path, mode: str, sample_rate: int = 1
     elif mode != "raw":
         raise EngineError(f"unsupported preprocessing mode: {mode}")
     filters.append(f"aresample={sample_rate}")
+    filters.append(f"apad=whole_len={target_frame_count}")
+    filters.append(f"atrim=end_sample={target_frame_count}")
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -232,39 +242,12 @@ def _make_segment(
     return Segment(_segment_id(lane, stage, start, end, parent), lane, stage, start, end, sample_rate, parent)
 
 
-def _split_long_coarse(
-    start: int,
-    end: int,
-    activity: Sequence[bool],
-    frame_samples: int,
-    config: SegmentationConfig,
-) -> list[tuple[int, int]]:
-    max_samples = round(config.coarse_max_seconds * 16_000)
-    if end - start <= max_samples:
-        return [(start, end)]
-    fine_frames = max(1, math.ceil(config.fine_silence_ms / config.frame_ms))
-    silence_midpoints = [
-        ((left + right) * frame_samples) // 2
-        for left, right in _runs(activity, False)
-        if right - left >= fine_frames and start < left * frame_samples < end
-    ]
-    pieces: list[tuple[int, int]] = []
-    cursor = start
-    while end - cursor > max_samples:
-        target = cursor + max_samples
-        candidates = [point for point in silence_midpoints if cursor + frame_samples < point <= target]
-        split = max(candidates) if candidates else target
-        pieces.append((cursor, split))
-        cursor = split
-    pieces.append((cursor, end))
-    return pieces
 
 
 def segment_track(
     track: AudioTrack,
     pcm: bytes,
     config: SegmentationConfig,
-    evidence_pcm: bytes | None = None,
 ) -> tuple[list[Segment], list[Segment], dict[str, float]]:
     dbfs, frame_samples = _frame_dbfs(pcm, track.sample_rate, config.frame_ms)
     noise_floor = _percentile(dbfs, 20.0)
@@ -277,29 +260,6 @@ def segment_track(
         max(1, math.ceil(config.bridge_gap_ms / config.frame_ms)),
         max(1, math.ceil(config.minimum_activity_ms / config.frame_ms)),
     )
-    evidence_noise_floor = noise_floor
-    evidence_threshold = threshold
-    if evidence_pcm is not None:
-        evidence_dbfs, evidence_frame_samples = _frame_dbfs(
-            evidence_pcm, track.sample_rate, config.frame_ms
-        )
-        if evidence_frame_samples != frame_samples or len(evidence_dbfs) != len(dbfs):
-            raise EngineError(f"raw and denoised activity frames differ for {track.lane}")
-        evidence_noise_floor = _percentile(evidence_dbfs, 20.0)
-        evidence_threshold = min(
-            config.threshold_max_dbfs,
-            max(
-                config.threshold_min_dbfs,
-                evidence_noise_floor + config.threshold_margin_db,
-            ),
-        )
-        evidence_activity = _smooth_activity(
-            [value >= evidence_threshold for value in evidence_dbfs],
-            max(1, math.ceil(config.bridge_gap_ms / config.frame_ms)),
-            max(1, math.ceil(config.minimum_activity_ms / config.frame_ms)),
-        )
-        activity = [left or right for left, right in zip(activity, evidence_activity)]
-        dbfs = [max(left, right) for left, right in zip(dbfs, evidence_dbfs)]
     active_runs = list(_runs(activity, True))
     if not active_runs:
         raise EngineError(f"no speech-like activity detected for {track.lane}")
@@ -350,9 +310,7 @@ def segment_track(
             track.frame_count,
             (last_active + 1) * frame_samples + coarse_padding,
         )
-        coarse_ranges.extend(
-            _split_long_coarse(start, end, activity, frame_samples, config)
-        )
+        coarse_ranges.append((start, end))
 
     coarse = [
         _make_segment(track.lane, "S2", start, end, track.sample_rate)
@@ -364,8 +322,6 @@ def segment_track(
     diagnostics = {
         "noise_floor_dbfs": noise_floor,
         "activity_threshold_dbfs": threshold,
-        "evidence_noise_floor_dbfs": evidence_noise_floor,
-        "evidence_threshold_dbfs": evidence_threshold,
         "active_fraction": sum(activity) / len(activity),
         "coarse_segments": float(len(coarse)),
         "fine_segments": float(len(fine)),

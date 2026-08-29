@@ -1,0 +1,11 @@
+fastapi<1,>=0.115
+uvicorn[standard]<1,>=0.30
+python-multipart<1,>=0.0.9
+gigaam[torch] @ https://github.com/salute-developers/GigaAM/archive/7447938d791c4f3e643386ee22c33777004293a5.zip
+transformers<6,>=4.48
+safetensors<1,>=0.4
+soundfile<1,>=0.12
+numpy<3,>=2
+
+[:python_version >= "3.13"]
+audioop-lts>=0.2.1

@@ -7,6 +7,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+import wave
 from unittest.mock import patch
 
 from l0_draft_engine.config import Settings
@@ -40,6 +41,21 @@ class FakeASR:
                 self.active -= 1
 
 
+class SpacedWordASR(FakeASR):
+    def __init__(self) -> None:
+        super().__init__()
+        self.input_durations: list[float] = []
+
+    def transcribe(self, path: str, **kwargs):
+        with wave.open(path, "rb") as audio:
+            self.input_durations.append(audio.getnframes() / audio.getframerate())
+        self.calls.append((path, kwargs))
+        words = [
+            SimpleNamespace(start=0.1, end=0.2, word=" Первый"),
+            SimpleNamespace(start=1.0, end=1.1, word=" второй"),
+        ]
+        return iter([SimpleNamespace(words=words)]), SimpleNamespace()
+
 class FakeFormatter:
     def __init__(self) -> None:
         self.calls: list[list[tuple[str, ...]]] = []
@@ -63,19 +79,28 @@ def draft_payload(task_id: str = "task-1") -> DraftPayload:
 
 
 def fake_prepare(lane: str, source: Path, derived_dir: Path, mode: str):
+    derived_path = derived_dir / f"{lane}-{mode}-full.wav"
+    derived_path.parent.mkdir(parents=True, exist_ok=True)
+    frame_count = 64_000
+    pcm = b"\x00\x00" * frame_count
+    with wave.open(str(derived_path), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(16_000)
+        audio.writeframes(pcm)
     track = AudioTrack(
         lane=lane,
         source_path=str(source),
-        derived_path=str(derived_dir / f"{lane}-{mode}-full.wav"),
+        derived_path=str(derived_path),
         sample_rate=16_000,
-        frame_count=64_000,
+        frame_count=frame_count,
         source_sha256=f"source-{lane}",
         pcm_sha256=f"pcm-{lane}",
     )
-    return track, b"\x00\x00" * track.frame_count
+    return track, pcm
 
 
-def fake_segment(track: AudioTrack, pcm: bytes, config, evidence_pcm=None):
+def fake_segment(track: AudioTrack, pcm: bytes, config):
     segment = Segment(
         id=f"{track.lane}-s2",
         lane=track.lane,
@@ -95,7 +120,7 @@ def audio_paths(directory: Path) -> dict[str, Path]:
     }
 
 
-def test_full_lane_asr_s2_grouping_mgm_prior_and_stable_rows() -> None:
+def test_s2_segment_asr_grouping_mgm_prior_and_stable_rows() -> None:
     asr = FakeASR()
     formatter = FakeFormatter()
     settings = Settings(preprocessing="raw")
@@ -123,12 +148,83 @@ def test_full_lane_asr_s2_grouping_mgm_prior_and_stable_rows() -> None:
     assert first.models["asr"]["name"] == "v3_ctc"
     assert len(asr.calls) == 4
     for path, kwargs in asr.calls:
-        assert path.endswith("-full.wav")
+        assert path.endswith(".wav")
+        assert "-s2-" in path
         assert kwargs["word_timestamps"] is True
         assert kwargs["vad_filter"] is False
         assert kwargs["hotwords"] == settings.hotwords
         assert kwargs["condition_on_previous_text"] is False
     assert formatter.calls[0][0] == ("Мгм",)
+
+
+def test_s2_range_is_the_model_input_and_one_babel_row() -> None:
+    asr = SpacedWordASR()
+    formatter = FakeFormatter()
+    engine = DraftEngine(
+        Settings(preprocessing="raw"),
+        asr_factory=lambda: asr,
+        formatter_factory=lambda: formatter,
+    )
+
+    def segmented_window(track: AudioTrack, pcm: bytes, config):
+        segment = Segment(
+            id=f"{track.lane}-window",
+            lane=track.lane,
+            stage="S2",
+            start_sample=16_000,
+            end_sample=48_000,
+            sample_rate=track.sample_rate,
+        )
+        return [segment], [], {"coarse_segments": 1.0, "active_fraction": 0.5}
+
+    with tempfile.TemporaryDirectory() as temporary, patch(
+        "l0_draft_engine.engine.prepare_track", side_effect=fake_prepare
+    ), patch(
+        "l0_draft_engine.engine.segment_track", side_effect=segmented_window
+    ):
+        response = engine.draft(draft_payload(), audio_paths(Path(temporary)))
+
+    assert asr.input_durations == [2.0, 2.0]
+    assert [(row.startSeconds, row.endSeconds) for row in response.rows] == [
+        (1.0, 3.0),
+        (1.0, 3.0),
+    ]
+    assert [row.text for row in response.rows] == [
+        "Первый второй.",
+        "Первый второй.",
+    ]
+    assert formatter.calls == [
+        [("Первый", "второй")],
+        [("Первый", "второй")],
+    ]
+
+
+def test_raw_asr_mode_still_segments_from_afftdn_pcm() -> None:
+    observed_segmentation_pcm: list[bytes] = []
+
+    def mode_marked_prepare(lane: str, source: Path, derived_dir: Path, mode: str):
+        track, _ = fake_prepare(lane, source, derived_dir, mode)
+        marker = b"\x11\x00" if mode == "afftdn" else b"\x22\x00"
+        return track, marker * track.frame_count
+
+    def record_segment(track: AudioTrack, pcm: bytes, config):
+        observed_segmentation_pcm.append(pcm)
+        return fake_segment(track, pcm, config)
+
+    engine = DraftEngine(
+        Settings(preprocessing="raw"),
+        asr_factory=FakeASR,
+        formatter_factory=FakeFormatter,
+    )
+    with tempfile.TemporaryDirectory() as temporary, patch(
+        "l0_draft_engine.engine.prepare_track", side_effect=mode_marked_prepare
+    ), patch(
+        "l0_draft_engine.engine.segment_track", side_effect=record_segment
+    ):
+        engine.draft(draft_payload(), audio_paths(Path(temporary)))
+
+    assert len(observed_segmentation_pcm) == 2
+    assert all(audio.startswith(b"\x11\x00") for audio in observed_segmentation_pcm)
 
 
 def test_preserve_rows_keeps_live_boundaries_ids_and_empty_interval_fallback() -> None:

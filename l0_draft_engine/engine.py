@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from bisect import bisect_left
+from dataclasses import dataclass
 from importlib.util import find_spec
+import math
 import re
+import tempfile
 import threading
 import time
 import uuid
+import wave
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -193,40 +196,82 @@ class DraftEngine:
             "models": models,
         }
 
-    def _transcribe_lane(self, model: Any, track: AudioTrack) -> list[Word]:
+    def _transcribe_lane(
+        self,
+        model: Any,
+        track: AudioTrack,
+        segments: Sequence[Segment],
+    ) -> list[Word]:
+        words: list[Word] = []
         try:
-            if isinstance(model, GigaAMRecognizer):
-                words = [
-                    Word(word.start, word.end, word.surface)
-                    for word in model.transcribe(Path(track.derived_path))
-                ]
-            else:
-                segments, _ = model.transcribe(
-                    track.derived_path,
-                    language="ru",
-                    beam_size=self.settings.beam_size,
-                    temperature=0.0,
-                    condition_on_previous_text=False,
-                    word_timestamps=True,
-                    vad_filter=False,
-                    hotwords=self.settings.hotwords,
-                )
-                words = []
-                for result in segments:
-                    for raw_word in result.words or ():
-                        if raw_word.start is None or raw_word.end is None:
-                            continue
-                        start = float(raw_word.start)
-                        end = float(raw_word.end)
-                        if start < 0 or end <= start:
-                            continue
-                        surface = EDGE_PUNCTUATION_RE.sub(
-                            "", str(raw_word.word).strip()
-                        )
-                        if not surface:
-                            continue
-                        surface = _apply_backchannel_prior(surface)
-                        words.append(Word(start, end, surface))
+            with wave.open(track.derived_path, "rb") as source:
+                if (
+                    source.getnchannels() != 1
+                    or source.getsampwidth() != 2
+                    or source.getframerate() != track.sample_rate
+                    or source.getnframes() != track.frame_count
+                ):
+                    raise L0EngineError(
+                        f"prepared audio metadata changed before ASR for {track.lane}"
+                    )
+                with tempfile.TemporaryDirectory(prefix=f"babel-{track.lane}-s2-") as temporary:
+                    for index, segment in enumerate(segments):
+                        source.setpos(segment.start_sample)
+                        pcm = source.readframes(segment.end_sample - segment.start_sample)
+                        segment_path = Path(temporary) / f"{index:06d}.wav"
+                        with wave.open(str(segment_path), "wb") as destination:
+                            destination.setnchannels(1)
+                            destination.setsampwidth(2)
+                            destination.setframerate(track.sample_rate)
+                            destination.writeframes(pcm)
+
+                        offset = segment.start_seconds
+                        if isinstance(model, GigaAMRecognizer):
+                            segment_words = (
+                                Word(
+                                    offset + word.start,
+                                    offset + word.end,
+                                    word.surface,
+                                )
+                                for word in model.transcribe(segment_path)
+                            )
+                        else:
+                            results, _ = model.transcribe(
+                                str(segment_path),
+                                language="ru",
+                                beam_size=self.settings.beam_size,
+                                temperature=0.0,
+                                condition_on_previous_text=False,
+                                word_timestamps=True,
+                                vad_filter=False,
+                                hotwords=self.settings.hotwords,
+                            )
+                            segment_words = (
+                                Word(
+                                    offset + float(raw_word.start),
+                                    offset + float(raw_word.end),
+                                    _apply_backchannel_prior(
+                                        EDGE_PUNCTUATION_RE.sub(
+                                            "", str(raw_word.word).strip()
+                                        )
+                                    ),
+                                )
+                                for result in results
+                                for raw_word in (result.words or ())
+                                if raw_word.start is not None
+                                and raw_word.end is not None
+                            )
+                        for word in segment_words:
+                            if (
+                                not math.isfinite(word.start)
+                                or not math.isfinite(word.end)
+                                or word.start < segment.start_seconds
+                                or word.end <= word.start
+                                or word.end > segment.end_seconds
+                                or not word.surface
+                            ):
+                                continue
+                            words.append(word)
         except Exception as exc:
             raise ModelUnavailableError(
                 f"ASR failed for lane {track.lane}: {exc}"
@@ -301,46 +346,29 @@ class DraftEngine:
         candidates = []
         for track_spec in payload.tracks:
             lane = track_spec.lane
-            lane_words = list(words_by_lane[lane])
+            lane_words = words_by_lane[lane]
             if not lane_words:
                 raise DraftInputError(f"ASR produced no words for lane {lane}")
-            groups: list[list[Word]] = []
-            current: list[Word] = []
-            for word in lane_words:
-                should_split = bool(current) and (
-                    word.start - current[-1].end >= 0.8
-                    or word.end - current[0].start > 12.0
-                    or len(current) >= 32
-                )
-                if should_split:
-                    groups.append(current)
-                    current = []
-                current.append(word)
-            if current:
-                groups.append(current)
-            sample_rate = tracks[lane].sample_rate
-            for index, group in enumerate(groups):
-                start_sample = max(0, round((group[0].start - 0.01) * sample_rate))
-                end_sample = min(
-                    tracks[lane].frame_count,
-                    round((group[-1].end + 0.01) * sample_rate),
-                )
-                end_sample = max(start_sample + 1, end_sample)
-                segment = Segment(
-                    id=f"word-group-{lane}-{index:06d}",
-                    lane=lane,
-                    stage="words",
-                    start_sample=start_sample,
-                    end_sample=end_sample,
-                    sample_rate=sample_rate,
-                )
-                candidates.append(
+            midpoints = midpoints_by_lane[lane]
+            lane_candidates: list[RowCandidate] = []
+            for segment in coarse_by_lane[lane]:
+                left = bisect_left(midpoints, segment.start_seconds)
+                right = bisect_left(midpoints, segment.end_seconds)
+                words = tuple(word.surface for word in lane_words[left:right])
+                if not words:
+                    continue
+                lane_candidates.append(
                     RowCandidate(
                         segment,
-                        tuple(word.surface for word in group),
+                        words,
                         tracks[lane].pcm_sha256,
                     )
                 )
+            if not lane_candidates:
+                raise DraftInputError(
+                    f"S2 segmentation contained no ASR words for lane {lane}"
+                )
+            candidates.extend(lane_candidates)
         return candidates
 
     def _format_candidates(self, candidates: Sequence[RowCandidate]) -> dict[str, str]:
@@ -398,18 +426,21 @@ class DraftEngine:
         try:
             for lane in expected_lanes:
                 track, pcm = prepare_track(lane, audio_paths[lane], workspace, preprocessing)
-                evidence_pcm: bytes | None = None
-                if preprocessing != "raw":
-                    _, evidence_pcm = prepare_track(lane, audio_paths[lane], workspace, "raw")
+                if preprocessing == "afftdn":
+                    segmentation_pcm = pcm
+                else:
+                    _, segmentation_pcm = prepare_track(
+                        lane, audio_paths[lane], workspace, "afftdn"
+                    )
                 coarse, _, lane_diagnostics = segment_track(
-                    track, pcm, self.settings.segmentation, evidence_pcm
+                    track, segmentation_pcm, self.settings.segmentation
                 )
                 if not coarse:
                     raise DraftInputError(f"segmentation produced no S2 rows for lane {lane}")
                 tracks[lane] = track
                 coarse_by_lane[lane] = coarse
                 diagnostics[lane] = lane_diagnostics
-                del pcm, evidence_pcm
+                del pcm, segmentation_pcm
         except DraftInputError:
             raise
         except L0EngineError as exc:
@@ -421,7 +452,10 @@ class DraftEngine:
             inference_started = time.perf_counter()
             model = self._get_asr()
             words_by_lane = {
-                lane: self._transcribe_lane(model, tracks[lane]) for lane in expected_lanes
+                lane: self._transcribe_lane(
+                    model, tracks[lane], coarse_by_lane[lane]
+                )
+                for lane in expected_lanes
             }
             asr_finished = time.perf_counter()
             candidates = self._group_rows(

@@ -53,4 +53,4 @@ LOCAL_ENGINE_GIGAAM_MODEL=C:\models\my-gigaam.ckpt
 LOCAL_ENGINE_PUNCTUATION_MODEL=C:\models\my-punctuation-model
 ```
 
-Docker mounts `./models` read-only and persists Hugging Face/GigaAM downloads in the `model-cache` volume. Windows keeps downloads under `.cache`; both runtimes remove completed multipart scratch files. `raw` preprocessing is the default, while `afftdn` remains an explicit opt-in requiring ffmpeg.
+Docker mounts `./models` read-only and persists Hugging Face/GigaAM downloads in the `model-cache` volume. Windows keeps downloads under `.cache`; both runtimes remove completed multipart scratch files. `raw` remains the default ASR input; S2 activity detection always uses a separately denoised `afftdn` lane. Choosing `afftdn` also uses that denoised lane for ASR.
