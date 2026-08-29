@@ -262,7 +262,13 @@ def segment_track(
     )
     active_runs = list(_runs(activity, True))
     if not active_runs:
-        raise EngineError(f"no speech-like activity detected for {track.lane}")
+        return [], [], {
+            "noise_floor_dbfs": noise_floor,
+            "activity_threshold_dbfs": threshold,
+            "active_fraction": 0.0,
+            "coarse_segments": 0.0,
+            "fine_segments": 0.0,
+        }
 
     coarse_silence_frames = max(1, math.ceil(config.coarse_silence_ms / config.frame_ms))
     coarse_padding = round(config.coarse_padding_ms * track.sample_rate / 1000)

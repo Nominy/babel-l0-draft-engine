@@ -8,7 +8,6 @@ import pytest
 
 from l0_draft_engine.pipeline import (
     AudioTrack,
-    EngineError,
     SegmentationConfig,
     prepare_track,
     segment_track,
@@ -66,8 +65,11 @@ def test_s2_splits_on_exactly_one_second_of_silence() -> None:
 def test_s2_ignores_short_noise_impulses_on_denoised_lane() -> None:
     audio = pcm((200, 0), (10, 2_000), (200, 0))
 
-    with pytest.raises(EngineError, match="no speech-like activity"):
-        segment_track(track_for(audio), audio, CONFIG)
+    coarse, fine, diagnostics = segment_track(track_for(audio), audio, CONFIG)
+
+    assert coarse == []
+    assert fine == []
+    assert diagnostics["active_fraction"] == 0.0
 
 
 @pytest.mark.parametrize("mode", ["raw", "afftdn"])
