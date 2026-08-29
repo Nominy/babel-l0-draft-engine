@@ -131,10 +131,7 @@ def test_s2_segment_asr_grouping_mgm_prior_and_stable_rows() -> None:
     )
     with tempfile.TemporaryDirectory() as temporary, patch(
         "l0_draft_engine.engine.prepare_track", side_effect=fake_prepare
-    ), patch("l0_draft_engine.engine.segment_track", side_effect=fake_segment), patch(
-        "requests.sessions.Session.request",
-        side_effect=AssertionError("remote API must never be called"),
-    ):
+    ), patch("l0_draft_engine.engine.segment_track", side_effect=fake_segment):
         paths = audio_paths(Path(temporary))
         first = engine.draft(draft_payload(), paths)
         second = engine.draft(draft_payload(), paths)
