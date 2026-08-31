@@ -31,6 +31,31 @@ REQUEST_ID_MAX_LENGTH = 128
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 
 
+class _EventLoopAdmissionGate:
+    def __init__(self, capacity: int) -> None:
+        self._capacity = capacity
+        self._inflight = 0
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def try_acquire(self) -> bool:
+        loop = asyncio.get_running_loop()
+        if self._loop is not loop:
+            if self._inflight:
+                raise RuntimeError("admission gate used from multiple event loops")
+            self._loop = loop
+        if self._inflight >= self._capacity:
+            return False
+        self._inflight += 1
+        return True
+
+    def release(self) -> None:
+        if asyncio.get_running_loop() is not self._loop:
+            raise RuntimeError("admission gate released from a different event loop")
+        if self._inflight <= 0:
+            raise RuntimeError("admission gate released without an acquired slot")
+        self._inflight -= 1
+
+
 def _request_id(request: Request) -> str:
     if "x-babel-request-id" not in request.headers:
         return str(uuid.uuid4())
@@ -60,6 +85,14 @@ async def _finish_cancelled_worker(task: asyncio.Task[Any]) -> None:
             task.result()
         except BaseException:
             pass
+
+
+async def _close_uploads(uploads: list[StarletteUploadFile]) -> None:
+    await asyncio.gather(
+        *(upload.close() for upload in uploads),
+        return_exceptions=True,
+    )
+
 
 class RequestBodyTooLarge(Exception):
     pass
@@ -201,6 +234,9 @@ def create_app(
     resolved_settings = settings or Settings.from_env()
     resolved_engine = engine or DraftEngine(resolved_settings)
     inference_queue = InferenceQueue()
+    admission_gate = _EventLoopAdmissionGate(
+        resolved_settings.max_inflight_requests
+    )
     service = FastAPI(title="Babel Local Drafting Engine", version="1.0.0")
     service.add_middleware(
         RequestSizeLimitMiddleware, max_bytes=resolved_settings.max_request_bytes
@@ -215,6 +251,7 @@ def create_app(
             "X-Babel-Local-Engine",
             "X-Babel-Request-Id",
         ],
+        expose_headers=["Retry-After"],
         max_age=600,
     )
     service.state.settings = resolved_settings
@@ -248,20 +285,30 @@ def create_app(
             and content_length > resolved_settings.max_request_bytes
         ):
             raise HTTPException(status_code=413, detail="request exceeds size limit")
+        if not admission_gate.try_acquire():
+            raise HTTPException(
+                status_code=429,
+                detail="too many in-flight requests",
+                headers={"Retry-After": "5"},
+            )
+
+        uploads: list[StarletteUploadFile] = []
         try:
-            form = await request.form()
-        except RequestBodyTooLarge:
-            raise
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail="invalid multipart request") from exc
-        uploads = [
-            value
-            for _, value in form.multi_items()
-            if isinstance(value, StarletteUploadFile)
-        ]
-        try:
+            try:
+                form = await request.form()
+            except RequestBodyTooLarge:
+                raise
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400, detail="invalid multipart request"
+                ) from exc
+            uploads = [
+                value
+                for _, value in form.multi_items()
+                if isinstance(value, StarletteUploadFile)
+            ]
             payload, files = _parse_form(form)
             with tempfile.TemporaryDirectory(prefix="babel-local-engine-") as temporary:
                 directory = Path(temporary)
@@ -269,11 +316,14 @@ def create_app(
                 total_file_bytes = 0
                 for index, track in enumerate(payload.tracks):
                     destination = directory / f"track-{index}.wav"
+                    upload = files[track.fieldName]
                     total_file_bytes += await _copy_upload(
-                        files[track.fieldName],
+                        upload,
                         destination,
                         resolved_settings.max_track_bytes,
                     )
+                    await upload.close()
+                    uploads.remove(upload)
                     if total_file_bytes > resolved_settings.max_request_bytes:
                         raise HTTPException(
                             status_code=413, detail="request exceeds size limit"
@@ -316,8 +366,15 @@ def create_app(
                     if worker.done():
                         inference_queue.complete(ticket)
         finally:
-            for upload in uploads:
-                await upload.close()
+            try:
+                cleanup = asyncio.create_task(_close_uploads(uploads))
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError as exc:
+                    await _finish_cancelled_worker(cleanup)
+                    raise exc
+            finally:
+                admission_gate.release()
 
     @service.post("/v1/draft", response_model=DraftResponse)
     async def draft(request: Request) -> DraftResponse:

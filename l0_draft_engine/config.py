@@ -49,6 +49,7 @@ class Settings:
     max_request_bytes: int = 500 * 1024 * 1024
     max_audio_seconds: float = 4 * 60 * 60
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
+    max_inflight_requests: int = 3
 
     def __post_init__(self) -> None:
         if self.host not in {"127.0.0.1", "localhost", "::1"}:
@@ -65,6 +66,10 @@ class Settings:
             raise SettingsError("LOCAL_ENGINE_HOTWORDS must not be empty")
         if self.max_request_bytes <= self.max_track_bytes * 2:
             raise SettingsError("LOCAL_ENGINE_MAX_REQUEST_BYTES must exceed two track limits")
+        if not 1 <= self.max_inflight_requests <= 64:
+            raise SettingsError(
+                "LOCAL_ENGINE_MAX_INFLIGHT_REQUESTS must be between 1 and 64"
+            )
 
     @property
     def punctuation_dtype(self) -> str:
@@ -92,6 +97,9 @@ class Settings:
             ),
             max_request_bytes=_env_int(
                 "LOCAL_ENGINE_MAX_REQUEST_BYTES", 500 * 1024 * 1024, 4096, 2**32
+            ),
+            max_inflight_requests=_env_int(
+                "LOCAL_ENGINE_MAX_INFLIGHT_REQUESTS", 3, 1, 64
             ),
             max_audio_seconds=_env_float(
                 "LOCAL_ENGINE_MAX_AUDIO_SECONDS", 4 * 60 * 60, 1.0, 24 * 60 * 60

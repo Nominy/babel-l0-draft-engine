@@ -441,6 +441,7 @@ class DraftEngine:
                 if preprocessing == "afftdn":
                     segmentation_pcm = pcm
                 else:
+                    pcm = None
                     _, segmentation_pcm = prepare_track(
                         lane, audio_paths[lane], workspace, "afftdn"
                     )

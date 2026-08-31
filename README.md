@@ -23,6 +23,8 @@ The service is published only at `127.0.0.1:8767`. Check it with `docker compose
 
 Clients may send `X-Babel-Request-Id` with either inference request and poll `GET /v1/queue/{requestId}`. The status response distinguishes `queued` requests with a one-based `position`, the active `running` request, and recently `completed` requests. Drafting and transcription share the same FIFO GPU queue.
 
+The engine admits at most three inference requests at a time by default (one running and two waiting). Set `LOCAL_ENGINE_MAX_INFLIGHT_REQUESTS` to an integer from 1 through 64 to change that bound. Requests above the bound receive HTTP 429 with `Retry-After: 5` before their multipart bodies are parsed.
+
 ## Self-host on Windows
 
 Install 64-bit Python 3.11 and a current NVIDIA driver. From PowerShell:

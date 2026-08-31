@@ -21,6 +21,24 @@ class GigaWord:
     surface: str
 
 
+def _convert_words(result: Any, offset: float) -> list[GigaWord]:
+    words: list[GigaWord] = []
+    for raw_word in result.words or ():
+        surface = str(raw_word.text).strip()
+        word_start = offset + float(raw_word.start)
+        word_end = offset + float(raw_word.end)
+        if (
+            not surface
+            or not math.isfinite(word_start)
+            or not math.isfinite(word_end)
+            or word_start < 0
+            or word_end <= word_start
+        ):
+            continue
+        words.append(GigaWord(word_start, word_end, surface))
+    return words
+
+
 def silence_boundaries(
     waveform: np.ndarray,
     sample_rate: int,
@@ -83,13 +101,19 @@ class GigaAMRecognizer:
 
     def transcribe(self, audio_path: Path) -> list[GigaWord]:
         model = self._load()
+        import torch
         try:
             waveform, sample_rate = sf.read(
-                audio_path, dtype="float32", always_2d=True
+                audio_path, dtype="float32", always_2d=False
             )
         except Exception as exc:
             raise GigaAMError(f"cannot read audio: {exc}") from exc
-        mono = waveform.mean(axis=1)
+        if waveform.ndim == 1:
+            mono = waveform
+        elif waveform.ndim == 2 and waveform.shape[1] == 1:
+            mono = waveform[:, 0]
+        else:
+            mono = waveform.mean(axis=1)
         boundaries = silence_boundaries(mono, sample_rate)
         words: list[GigaWord] = []
         import tempfile
@@ -103,27 +127,20 @@ class GigaAMRecognizer:
                     sample_rate,
                     subtype="PCM_16",
                 )
+                result: Any | None = None
                 try:
-                    result = model.transcribe(
-                        str(chunk_path), word_timestamps=True
-                    )
+                    with torch.inference_mode():
+                        result = model.transcribe(
+                            str(chunk_path), word_timestamps=True
+                        )
                 except Exception as exc:
                     raise GigaAMError(
                         f"GigaAM inference failed for chunk {index}: {exc}"
                     ) from exc
-                offset = start / sample_rate
-                for raw_word in result.words or ():
-                    surface = str(raw_word.text).strip()
-                    word_start = offset + float(raw_word.start)
-                    word_end = offset + float(raw_word.end)
-                    if (
-                        not surface
-                        or not math.isfinite(word_start)
-                        or not math.isfinite(word_end)
-                        or word_start < 0
-                        or word_end <= word_start
-                    ):
-                        continue
-                    words.append(GigaWord(word_start, word_end, surface))
+                try:
+                    chunk_words = _convert_words(result, start / sample_rate)
+                finally:
+                    del result
+                words.extend(chunk_words)
         words.sort(key=lambda word: (word.start, word.end, word.surface))
         return words

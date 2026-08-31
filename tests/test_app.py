@@ -439,6 +439,113 @@ async def test_concurrent_draft_requests_wait_and_execute_one_at_a_time() -> Non
 
 
 @pytest.mark.anyio
+async def test_admission_rejects_a_fourth_request_before_body_parsing() -> None:
+    settings = Settings(max_inflight_requests=3)
+    engine = FakeEngine(hold_first_draft=True)
+    app = create_app(settings, engine)  # type: ignore[arg-type]
+
+    async def post_draft(
+        client: httpx.AsyncClient, request_id: str
+    ) -> httpx.Response:
+        return await client.post(
+            "/v1/draft",
+            data={"payload": payload()},
+            files={
+                "audio:1": ("first.wav", wav_bytes(), "audio/wav"),
+                "audio:2": ("second.wav", wav_bytes(), "audio/wav"),
+            },
+            headers={**PROXY_HEADERS, "X-Babel-Request-Id": request_id},
+        )
+
+    async def wait_until_registered(
+        client: httpx.AsyncClient, request_id: str
+    ) -> None:
+        for _ in range(100):
+            if (await client.get(f"/v1/queue/{request_id}")).status_code == 200:
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"queue status never appeared for {request_id}")
+
+    body_was_read = False
+
+    async def rejected_body():
+        nonlocal body_was_read
+        body_was_read = True
+        yield b"this body must not be parsed"
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        first_task = asyncio.create_task(post_draft(client, "admitted-first"))
+        assert await asyncio.to_thread(engine.first_draft_started.wait, 2)
+        second_task = asyncio.create_task(post_draft(client, "admitted-second"))
+        await wait_until_registered(client, "admitted-second")
+        third_task = asyncio.create_task(post_draft(client, "admitted-third"))
+        await wait_until_registered(client, "admitted-third")
+        try:
+            rejected = await client.post(
+                "/v1/draft",
+                content=rejected_body(),
+                headers={
+                    **PROXY_HEADERS,
+                    "Content-Type": "multipart/form-data; boundary=unused",
+                    "X-Babel-Request-Id": "rejected-fourth",
+                    "Origin": "https://dashboard.babel.audio",
+                },
+            )
+            assert rejected.status_code == 429
+            assert rejected.headers["retry-after"] == "5"
+            assert rejected.headers["access-control-expose-headers"] == "Retry-After"
+            assert rejected.json()["detail"] == "too many in-flight requests"
+            assert body_was_read is False
+            assert engine.draft_calls == 1
+            assert (
+                await client.get("/v1/queue/rejected-fourth")
+            ).status_code == 404
+        finally:
+            engine.release_first_draft.set()
+            admitted_responses = await asyncio.gather(
+                first_task, second_task, third_task
+            )
+
+    assert all(response.status_code == 200 for response in admitted_responses)
+    assert engine.draft_calls == 3
+    assert engine.max_active_drafts == 1
+
+
+@pytest.mark.anyio
+async def test_admission_slot_recovers_after_invalid_and_completed_requests() -> None:
+    settings = Settings(max_inflight_requests=1)
+    engine = FakeEngine()
+    app = create_app(settings, engine)  # type: ignore[arg-type]
+
+    async def post_draft(
+        client: httpx.AsyncClient, request_payload: str
+    ) -> httpx.Response:
+        return await client.post(
+            "/v1/draft",
+            data={"payload": request_payload},
+            files={
+                "audio:1": ("first.wav", wav_bytes(), "audio/wav"),
+                "audio:2": ("second.wav", wav_bytes(), "audio/wav"),
+            },
+            headers=PROXY_HEADERS,
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        invalid = await post_draft(client, "{")
+        after_invalid = await post_draft(client, payload())
+        after_completion = await post_draft(client, payload())
+
+    assert invalid.status_code == 422
+    assert after_invalid.status_code == 200, after_invalid.text
+    assert after_completion.status_code == 200, after_completion.text
+    assert engine.draft_calls == 2
+
+
+@pytest.mark.anyio
 async def test_queue_status_reports_running_position_and_completion() -> None:
     settings = Settings()
     engine = FakeEngine(hold_first_draft=True)
@@ -557,3 +664,37 @@ async def test_cors_allows_dashboard_and_loopback_origins_only() -> None:
     assert dashboard.headers["access-control-allow-origin"] == "https://dashboard.babel.audio"
     assert local.headers["access-control-allow-origin"] == "http://localhost:3000"
     assert "access-control-allow-origin" not in remote.headers
+
+
+@pytest.mark.anyio
+async def test_cors_preflight_allows_engine_request_headers() -> None:
+    app = create_app(Settings(), FakeEngine())  # type: ignore[arg-type]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        response = await client.options(
+            "/v1/draft",
+            headers={
+                "Origin": "https://dashboard.babel.audio",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": (
+                    "content-type, x-babel-local-engine, x-babel-request-id"
+                ),
+            },
+        )
+
+    assert response.status_code == 200
+    assert (
+        response.headers["access-control-allow-origin"]
+        == "https://dashboard.babel.audio"
+    )
+    assert "POST" in response.headers["access-control-allow-methods"].split(", ")
+    allowed_headers = {
+        header.strip().lower()
+        for header in response.headers["access-control-allow-headers"].split(",")
+    }
+    assert {
+        "content-type",
+        "x-babel-local-engine",
+        "x-babel-request-id",
+    } <= allowed_headers
