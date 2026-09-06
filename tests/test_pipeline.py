@@ -46,7 +46,7 @@ def track_for(audio: bytes) -> AudioTrack:
 
 
 def s2_ranges(audio: bytes) -> list[tuple[int, int]]:
-    coarse, _, _ = segment_track(track_for(audio), audio, CONFIG)
+    coarse, _ = segment_track(track_for(audio), audio, CONFIG)
     return [(segment.start_sample, segment.end_sample) for segment in coarse]
 
 
@@ -65,10 +65,9 @@ def test_s2_splits_on_exactly_one_second_of_silence() -> None:
 def test_s2_ignores_short_noise_impulses_on_denoised_lane() -> None:
     audio = pcm((200, 0), (10, 2_000), (200, 0))
 
-    coarse, fine, diagnostics = segment_track(track_for(audio), audio, CONFIG)
+    coarse, diagnostics = segment_track(track_for(audio), audio, CONFIG)
 
     assert coarse == []
-    assert fine == []
     assert diagnostics["active_fraction"] == 0.0
 
 

@@ -38,7 +38,6 @@ class Segment:
     start_sample: int
     end_sample: int
     sample_rate: int
-    parent_id: str | None = None
 
     @property
     def start_seconds(self) -> float:
@@ -59,11 +58,6 @@ class SegmentationConfig:
     minimum_activity_ms: int = 120
     coarse_silence_ms: int = 1000
     coarse_padding_ms: int = 0
-    fine_silence_ms: int = 250
-    fine_min_seconds: float = 2.5
-    fine_target_seconds: float = 8.0
-    fine_max_seconds: float = 14.0
-    fine_hard_max_seconds: float = 24.0
 
 
 def _sha256_file(path: Path) -> str:
@@ -224,8 +218,8 @@ def _smooth_activity(activity: list[bool], bridge_frames: int, minimum_frames: i
     return result
 
 
-def _segment_id(lane: str, stage: str, start: int, end: int, parent: str | None = None) -> str:
-    identity = f"{lane}|{stage}|{start}|{end}|{parent or ''}"
+def _segment_id(lane: str, stage: str, start: int, end: int) -> str:
+    identity = f"{lane}|{stage}|{start}|{end}|"
     return str(uuid.uuid5(ROW_NAMESPACE, identity))
 
 
@@ -235,11 +229,10 @@ def _make_segment(
     start: int,
     end: int,
     sample_rate: int,
-    parent: str | None = None,
 ) -> Segment:
     if start < 0 or end <= start:
         raise EngineError(f"invalid {stage} segment {lane} {start}:{end}")
-    return Segment(_segment_id(lane, stage, start, end, parent), lane, stage, start, end, sample_rate, parent)
+    return Segment(_segment_id(lane, stage, start, end), lane, stage, start, end, sample_rate)
 
 
 
@@ -248,7 +241,7 @@ def segment_track(
     track: AudioTrack,
     pcm: bytes,
     config: SegmentationConfig,
-) -> tuple[list[Segment], list[Segment], dict[str, float]]:
+) -> tuple[list[Segment], dict[str, float]]:
     dbfs, frame_samples = _frame_dbfs(pcm, track.sample_rate, config.frame_ms)
     noise_floor = _percentile(dbfs, 20.0)
     threshold = min(
@@ -262,12 +255,11 @@ def segment_track(
     )
     active_runs = list(_runs(activity, True))
     if not active_runs:
-        return [], [], {
+        return [], {
             "noise_floor_dbfs": noise_floor,
             "activity_threshold_dbfs": threshold,
             "active_fraction": 0.0,
             "coarse_segments": 0.0,
-            "fine_segments": 0.0,
         }
 
     coarse_silence_frames = max(1, math.ceil(config.coarse_silence_ms / config.frame_ms))
@@ -322,69 +314,14 @@ def segment_track(
         _make_segment(track.lane, "S2", start, end, track.sample_rate)
         for start, end in coarse_ranges
     ]
-    fine: list[Segment] = []
-    for parent in coarse:
-        fine.extend(_fine_segments(parent, activity, dbfs, frame_samples, config))
     diagnostics = {
         "noise_floor_dbfs": noise_floor,
         "activity_threshold_dbfs": threshold,
         "active_fraction": sum(activity) / len(activity),
         "coarse_segments": float(len(coarse)),
-        "fine_segments": float(len(fine)),
     }
-    return coarse, fine, diagnostics
+    return coarse, diagnostics
 
-
-def _fine_segments(
-    parent: Segment,
-    activity: Sequence[bool],
-    dbfs: Sequence[float],
-    frame_samples: int,
-    config: SegmentationConfig,
-) -> list[Segment]:
-    start_frame = parent.start_sample // frame_samples
-    end_frame = min(len(activity), math.ceil(parent.end_sample / frame_samples))
-    minimum_silence_frames = max(1, math.ceil(config.fine_silence_ms / config.frame_ms))
-    candidates = [
-        ((left + right) * frame_samples) // 2
-        for left, right in _runs(activity[start_frame:end_frame], False)
-        if right - left >= minimum_silence_frames
-    ]
-    candidates = [parent.start_sample + point for point in candidates]
-    min_length = round(config.fine_min_seconds * parent.sample_rate)
-    target_length = round(config.fine_target_seconds * parent.sample_rate)
-    max_length = round(config.fine_max_seconds * parent.sample_rate)
-    hard_max = round(config.fine_hard_max_seconds * parent.sample_rate)
-
-    boundaries = [parent.start_sample]
-    cursor = parent.start_sample
-    while parent.end_sample - cursor > max_length:
-        eligible = [point for point in candidates if cursor + min_length <= point <= cursor + max_length]
-        if eligible:
-            target = cursor + target_length
-            split = min(eligible, key=lambda point: (abs(point - target), point))
-        elif parent.end_sample - cursor <= hard_max:
-            break
-        else:
-            target_frame = (cursor + target_length) // frame_samples
-            radius = max(1, round(1.0 * parent.sample_rate / frame_samples))
-            low = max(cursor // frame_samples + 1, target_frame - radius)
-            high = min(end_frame - 1, target_frame + radius)
-            if high <= low:
-                split = min(parent.end_sample - 1, cursor + target_length)
-            else:
-                quietest = min(range(low, high + 1), key=lambda index: (dbfs[index], abs(index - target_frame)))
-                split = quietest * frame_samples
-        if split <= cursor or split >= parent.end_sample:
-            break
-        boundaries.append(split)
-        cursor = split
-    boundaries.append(parent.end_sample)
-    return [
-        _make_segment(parent.lane, "S3", start, end, parent.sample_rate, parent.id)
-        for start, end in zip(boundaries, boundaries[1:])
-        if end > start
-    ]
 
 def _apply_backchannel_prior(text: str) -> str:
     def replace(match: re.Match[str]) -> str:

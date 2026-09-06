@@ -106,12 +106,7 @@ class PunctuationFormatter:
             raise L2ModelError(f"punctuation inference failed: {exc}") from exc
         labels: list[str] = []
         for word_index in range(len(words)):
-            try:
-                token_index = word_ids.index(word_index)
-            except ValueError as exc:
-                raise L2ModelError(
-                    f"punctuation tokenizer lost word {word_index}"
-                ) from exc
+            token_index = word_ids.index(word_index)
             raw_label = str(
                 model.config.id2label[int(prediction_ids[token_index])]
             )

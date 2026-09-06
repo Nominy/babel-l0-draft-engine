@@ -149,7 +149,7 @@ def _content_length(request: Request) -> int | None:
     return value
 
 
-async def _copy_upload(upload: UploadFile, destination: Path, limit: int) -> int:
+async def _copy_upload(upload: UploadFile, destination: Path, limit: int) -> None:
     size = 0
     try:
         with destination.open("xb") as output:
@@ -164,7 +164,6 @@ async def _copy_upload(upload: UploadFile, destination: Path, limit: int) -> int
     if size == 0:
         destination.unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail="audio track is empty")
-    return size
 
 
 def _validate_mono_wav(path: Path, max_audio_seconds: float) -> None:
@@ -313,21 +312,16 @@ def create_app(
             with tempfile.TemporaryDirectory(prefix="babel-local-engine-") as temporary:
                 directory = Path(temporary)
                 paths: dict[str, Path] = {}
-                total_file_bytes = 0
                 for index, track in enumerate(payload.tracks):
                     destination = directory / f"track-{index}.wav"
                     upload = files[track.fieldName]
-                    total_file_bytes += await _copy_upload(
+                    await _copy_upload(
                         upload,
                         destination,
                         resolved_settings.max_track_bytes,
                     )
                     await upload.close()
                     uploads.remove(upload)
-                    if total_file_bytes > resolved_settings.max_request_bytes:
-                        raise HTTPException(
-                            status_code=413, detail="request exceeds size limit"
-                        )
                     _validate_mono_wav(
                         destination, resolved_settings.max_audio_seconds
                     )

@@ -60,3 +60,7 @@ LOCAL_ENGINE_PUNCTUATION_MODEL=C:\models\my-punctuation-model
 ```
 
 Docker mounts `./models` read-only and persists Hugging Face/GigaAM downloads in the `model-cache` volume. Windows keeps downloads under `.cache`; both runtimes remove completed multipart scratch files. `raw` remains the default ASR input; S2 activity detection always uses a separately denoised `afftdn` lane. Choosing `afftdn` also uses that denoised lane for ASR.
+
+Segmentation returns S2 activity ranges and per-lane diagnostics (`noise_floor_dbfs`, `activity_threshold_dbfs`, `active_fraction`, and `coarse_segments`). GigaAM independently windows long S2 inputs at silence for inference; output word timestamps remain absolute within each lane.
+
+Injected recognizers use the same contract as `GigaAMRecognizer`: `transcribe(Path)` returns timestamped words with `start`, `end`, and `surface` fields relative to the supplied audio window. Recognized surfaces are preserved, including backchannels; the backchannel prior applies only to preserved-row fallback text.

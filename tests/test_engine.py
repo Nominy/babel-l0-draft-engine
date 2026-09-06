@@ -6,36 +6,35 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
 import wave
 from unittest.mock import patch
 
 from l0_draft_engine.config import Settings
 from l0_draft_engine.engine import DraftEngine
+from l0_draft_engine.gigaam_asr import GigaWord
 from l0_draft_engine.schemas import DraftPayload
 from l0_draft_engine.pipeline import AudioTrack, Segment
 
 
 class FakeASR:
     def __init__(self, delay: float = 0.0) -> None:
-        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.calls: list[Path] = []
         self.delay = delay
         self.active = 0
         self.max_active = 0
         self._counter_lock = threading.Lock()
 
-    def transcribe(self, path: str, **kwargs):
+    def transcribe(self, path: Path) -> list[GigaWord]:
         with self._counter_lock:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
         try:
             if self.delay:
                 time.sleep(self.delay)
-            lane = "speaker-1" if "speaker-1" in path else "speaker-2"
-            surface = " Угу," if lane == "speaker-1" else " Привет."
-            words = [SimpleNamespace(start=0.5, end=0.8, word=surface)]
-            self.calls.append((path, kwargs))
-            return iter([SimpleNamespace(words=words)]), SimpleNamespace()
+            lane = "speaker-1" if "speaker-1" in str(path) else "speaker-2"
+            surface = "Угу" if lane == "speaker-1" else "Привет"
+            self.calls.append(path)
+            return [GigaWord(start=0.5, end=0.8, surface=surface)]
         finally:
             with self._counter_lock:
                 self.active -= 1
@@ -46,24 +45,19 @@ class SpacedWordASR(FakeASR):
         super().__init__()
         self.input_durations: list[float] = []
 
-    def transcribe(self, path: str, **kwargs):
-        with wave.open(path, "rb") as audio:
+    def transcribe(self, path: Path) -> list[GigaWord]:
+        with wave.open(str(path), "rb") as audio:
             self.input_durations.append(audio.getnframes() / audio.getframerate())
-        self.calls.append((path, kwargs))
-        words = [
-            SimpleNamespace(start=0.1, end=0.2, word=" Первый"),
-            SimpleNamespace(start=1.0, end=1.1, word=" второй"),
+        self.calls.append(path)
+        return [
+            GigaWord(start=1.0, end=1.1, surface="второй"),
+            GigaWord(start=1.9, end=2.1, surface="за-пределами"),
+            GigaWord(start=0.1, end=0.2, surface="Первый"),
         ]
-        return iter([SimpleNamespace(words=words)]), SimpleNamespace()
 
 class FakeFormatter:
-    def __init__(self) -> None:
-        self.calls: list[list[tuple[str, ...]]] = []
-
     def format_rows(self, rows):
-        values = [tuple(row) for row in rows]
-        self.calls.append(values)
-        return [" ".join(row) + "." for row in values]
+        return [" ".join(row) + "." for row in rows]
 
 
 def draft_payload(task_id: str = "task-1") -> DraftPayload:
@@ -110,7 +104,7 @@ def fake_segment(track: AudioTrack, pcm: bytes, config):
         sample_rate=track.sample_rate,
     )
     diagnostics = {"coarse_segments": 1.0, "active_fraction": 1.0}
-    return [segment], [], diagnostics
+    return [segment], diagnostics
 
 
 def audio_paths(directory: Path) -> dict[str, Path]:
@@ -120,7 +114,7 @@ def audio_paths(directory: Path) -> dict[str, Path]:
     }
 
 
-def test_s2_segment_asr_grouping_mgm_prior_and_stable_rows() -> None:
+def test_s2_segment_asr_preserves_gigaam_surfaces_and_stable_rows() -> None:
     asr = FakeASR()
     formatter = FakeFormatter()
     settings = Settings(preprocessing="raw")
@@ -140,18 +134,10 @@ def test_s2_segment_asr_grouping_mgm_prior_and_stable_rows() -> None:
     assert all(uuid.UUID(row.id).version == 5 for row in first.rows)
     assert {row.lane for row in first.rows} == {"speaker-1", "speaker-2"}
     assert all(row.endSeconds > row.startSeconds for row in first.rows)
-    assert next(row.text for row in first.rows if row.lane == "speaker-1") == "Мгм."
+    assert next(row.text for row in first.rows if row.lane == "speaker-1") == "Угу."
     assert first.summary["rowCount"] == 2
     assert first.models["asr"]["name"] == "v3_ctc"
     assert len(asr.calls) == 4
-    for path, kwargs in asr.calls:
-        assert path.endswith(".wav")
-        assert "-s2-" in path
-        assert kwargs["word_timestamps"] is True
-        assert kwargs["vad_filter"] is False
-        assert kwargs["hotwords"] == settings.hotwords
-        assert kwargs["condition_on_previous_text"] is False
-    assert formatter.calls[0][0] == ("Мгм",)
 
 
 def test_silent_lane_is_omitted_from_replacement_rows() -> None:
@@ -165,7 +151,7 @@ def test_silent_lane_is_omitted_from_replacement_rows() -> None:
 
     def segment_only_speaker(track: AudioTrack, pcm: bytes, config):
         if track.lane == "speaker-2":
-            return [], [], {"coarse_segments": 0.0, "active_fraction": 0.0}
+            return [], {"coarse_segments": 0.0, "active_fraction": 0.0}
         return fake_segment(track, pcm, config)
 
     with tempfile.TemporaryDirectory() as temporary, patch(
@@ -199,16 +185,18 @@ def test_s2_range_is_the_model_input_and_one_babel_row() -> None:
             end_sample=48_000,
             sample_rate=track.sample_rate,
         )
-        return [segment], [], {"coarse_segments": 1.0, "active_fraction": 0.5}
+        return [segment], {"coarse_segments": 1.0, "active_fraction": 0.5}
 
     with tempfile.TemporaryDirectory() as temporary, patch(
         "l0_draft_engine.engine.prepare_track", side_effect=fake_prepare
     ), patch(
         "l0_draft_engine.engine.segment_track", side_effect=segmented_window
     ):
-        response = engine.draft(draft_payload(), audio_paths(Path(temporary)))
+        paths = audio_paths(Path(temporary))
+        response = engine.draft(draft_payload(), paths)
+        transcription = engine.transcribe(draft_payload(), paths)
 
-    assert asr.input_durations == [2.0, 2.0]
+    assert asr.input_durations == [2.0, 2.0, 2.0, 2.0]
     assert [(row.startSeconds, row.endSeconds) for row in response.rows] == [
         (1.0, 3.0),
         (1.0, 3.0),
@@ -217,9 +205,12 @@ def test_s2_range_is_the_model_input_and_one_babel_row() -> None:
         "Первый второй.",
         "Первый второй.",
     ]
-    assert formatter.calls == [
-        [("Первый", "второй")],
-        [("Первый", "второй")],
+    assert [
+        [(token.text, token.startSeconds, token.endSeconds) for token in track.tokens]
+        for track in transcription.tracks
+    ] == [
+        [("Первый", 1.1, 1.2), ("второй", 2.0, 2.1)],
+        [("Первый", 1.1, 1.2), ("второй", 2.0, 2.1)],
     ]
 
 
@@ -308,7 +299,7 @@ def test_preserve_rows_keeps_live_boundaries_ids_and_empty_interval_fallback() -
         (0.0, 1.0),
     ]
     assert response.rows[0].text == "Мгм."
-    assert response.rows[1].text == "Мгм."
+    assert response.rows[1].text == "Угу."
     assert response.summary["rowCount"] == 3
     assert response.summary["preservedRows"] is True
 
@@ -381,7 +372,7 @@ def test_transcribe_returns_stable_ordered_word_timing_without_formatter() -> No
         [(token.text, token.startSeconds, token.endSeconds) for token in track.tokens]
         for track in first.tracks
     ] == [
-        [("Мгм", 0.5, 0.8)],
+        [("Угу", 0.5, 0.8)],
         [("Привет", 0.5, 0.8)],
     ]
     assert [
@@ -407,7 +398,7 @@ def test_transcribe_keeps_silent_and_fully_empty_lanes_as_empty_tracks() -> None
 
         def segment_with_silence(track: AudioTrack, pcm: bytes, config):
             if track.lane in silent_lanes:
-                return [], [], {"coarse_segments": 0.0, "active_fraction": 0.0}
+                return [], {"coarse_segments": 0.0, "active_fraction": 0.0}
             return fake_segment(track, pcm, config)
 
         engine = DraftEngine(

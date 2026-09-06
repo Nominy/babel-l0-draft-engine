@@ -41,9 +41,6 @@ class Settings:
     gigaam_model_path: str | Path = "v3_ctc"
     punctuation_model_path: str | Path = "kontur-ai/sbert_punc_case_ru"
     preprocessing: str = "raw"
-    beam_size: int = 5
-    hotwords: str = "Мгм мгм Угу угу Ага ага"
-    cpu_threads: int = 4
     punctuation_chunk_words: int = 60
     max_track_bytes: int = 240 * 1024 * 1024
     max_request_bytes: int = 500 * 1024 * 1024
@@ -62,8 +59,6 @@ class Settings:
             raise SettingsError("LOCAL_ENGINE_GIGAAM_MODEL must not be empty")
         if not str(self.punctuation_model_path).strip():
             raise SettingsError("LOCAL_ENGINE_PUNCTUATION_MODEL must not be empty")
-        if not self.hotwords.strip():
-            raise SettingsError("LOCAL_ENGINE_HOTWORDS must not be empty")
         if self.max_request_bytes <= self.max_track_bytes * 2:
             raise SettingsError("LOCAL_ENGINE_MAX_REQUEST_BYTES must exceed two track limits")
         if not 1 <= self.max_inflight_requests <= 64:
@@ -86,9 +81,6 @@ class Settings:
                 "LOCAL_ENGINE_PUNCTUATION_MODEL", "kontur-ai/sbert_punc_case_ru"
             ).strip(),
             preprocessing=os.environ.get("LOCAL_ENGINE_PREPROCESSING", "raw").strip().lower(),
-            beam_size=_env_int("LOCAL_ENGINE_BEAM_SIZE", 5, 1, 10),
-            hotwords=os.environ.get("LOCAL_ENGINE_HOTWORDS", "Мгм мгм Угу угу Ага ага"),
-            cpu_threads=_env_int("LOCAL_ENGINE_CPU_THREADS", 4, 1, 32),
             punctuation_chunk_words=_env_int(
                 "LOCAL_ENGINE_PUNCTUATION_CHUNK_WORDS", 60, 16, 300
             ),

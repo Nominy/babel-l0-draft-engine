@@ -38,7 +38,6 @@ from .schemas import (
 ROW_NAMESPACE = uuid.UUID("54057e89-dfb6-5f31-925d-6119e48bdac4")
 TOKEN_NAMESPACE = uuid.UUID("a7517066-1d3b-52f5-a6f9-6a38a59ffde7")
 MARKUP_RE = re.compile(r"\[[^\[\]\r\n]+\]|</?[^<>\r\n]+>|\{[^{}\r\n]+\}")
-EDGE_PUNCTUATION_RE = re.compile(r'^["«»„“”(),.!?;:…]+|["«»„“”(),.!?;:…]+$')
 
 
 class DraftInputError(ValueError):
@@ -227,41 +226,14 @@ class DraftEngine:
                             destination.writeframes(pcm)
 
                         offset = segment.start_seconds
-                        if isinstance(model, GigaAMRecognizer):
-                            segment_words = (
-                                Word(
-                                    offset + word.start,
-                                    offset + word.end,
-                                    word.surface,
-                                )
-                                for word in model.transcribe(segment_path)
+                        segment_words = (
+                            Word(
+                                offset + word.start,
+                                offset + word.end,
+                                word.surface,
                             )
-                        else:
-                            results, _ = model.transcribe(
-                                str(segment_path),
-                                language="ru",
-                                beam_size=self.settings.beam_size,
-                                temperature=0.0,
-                                condition_on_previous_text=False,
-                                word_timestamps=True,
-                                vad_filter=False,
-                                hotwords=self.settings.hotwords,
-                            )
-                            segment_words = (
-                                Word(
-                                    offset + float(raw_word.start),
-                                    offset + float(raw_word.end),
-                                    _apply_backchannel_prior(
-                                        EDGE_PUNCTUATION_RE.sub(
-                                            "", str(raw_word.word).strip()
-                                        )
-                                    ),
-                                )
-                                for result in results
-                                for raw_word in (result.words or ())
-                                if raw_word.start is not None
-                                and raw_word.end is not None
-                            )
+                            for word in model.transcribe(segment_path)
+                        )
                         for word in segment_words:
                             if (
                                 not math.isfinite(word.start)
@@ -445,7 +417,7 @@ class DraftEngine:
                     _, segmentation_pcm = prepare_track(
                         lane, audio_paths[lane], workspace, "afftdn"
                     )
-                coarse, _, lane_diagnostics = segment_track(
+                coarse, lane_diagnostics = segment_track(
                     track, segmentation_pcm, self.settings.segmentation
                 )
                 tracks[lane] = track
