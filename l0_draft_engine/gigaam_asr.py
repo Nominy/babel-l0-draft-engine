@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -92,11 +93,19 @@ class GigaAMRecognizer:
 
             self._model = gigaam.load_model(
                 self.model,
+                # Keep FP32 weights on both GPUs; upstream forward still uses
+                # FP16 encoder autocast on CUDA and MPS.
                 fp16_encoder=False,
                 device=self.device,
             )
         except Exception as exc:
             raise GigaAMError(f"cannot load GigaAM checkpoint: {exc}") from exc
+        finally:
+            # GigaAM only formats this optional-import error as text. Keeping
+            # its traceback pins the first model's loading frames and weights.
+            encoder = sys.modules.get("gigaam.encoder")
+            if isinstance(getattr(encoder, "IMPORT_FLASH_ERR", None), BaseException):
+                encoder.IMPORT_FLASH_ERR = str(encoder.IMPORT_FLASH_ERR)
         return self._model
 
     def transcribe(self, audio_path: Path) -> list[GigaWord]:

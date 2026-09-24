@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import gc
 import sys
+import weakref
 from types import SimpleNamespace
 
 import numpy as np
@@ -82,3 +84,33 @@ def test_recognizer_enters_inference_mode_for_each_chunk(tmp_path, monkeypatch) 
     assert recognizer.transcribe(audio_path) == []
     assert model.calls > 1
     assert inference == {"active": False, "entries": model.calls}
+
+
+def test_optional_flash_import_error_does_not_keep_loaded_model_alive(monkeypatch):
+    class Model:
+        pass
+
+    encoder = SimpleNamespace()
+    references = []
+
+    def load_model(*args, **kwargs):
+        # The upstream encoder saves this optional import failure globally.
+        # Its traceback reaches the loading frame and its eventual model local.
+        try:
+            raise ModuleNotFoundError("optional accelerator is unavailable")
+        except ModuleNotFoundError as error:
+            encoder.IMPORT_FLASH_ERR = error
+        model = Model()
+        references.append(weakref.ref(model))
+        return model
+
+    monkeypatch.setitem(sys.modules, "gigaam", SimpleNamespace(load_model=load_model))
+    monkeypatch.setitem(sys.modules, "gigaam.encoder", encoder)
+    recognizer = GigaAMRecognizer("local.ckpt", "cpu")
+    recognizer._load()
+    assert references[0]() is not None
+
+    del recognizer
+    gc.collect()
+
+    assert references[0]() is None

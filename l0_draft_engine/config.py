@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,11 +34,17 @@ def _env_float(name: str, default: float, minimum: float, maximum: float) -> flo
     return value
 
 
+def _default_device() -> str:
+    if platform.system() == "Darwin" and platform.machine().lower() in {"arm64", "aarch64"}:
+        return "mps"
+    return "cuda"
+
+
 @dataclass(frozen=True)
 class Settings:
     host: str = "127.0.0.1"
     port: int = 8767
-    device: str = "cuda"
+    device: str = field(default_factory=_default_device)
     gigaam_model_path: str | Path = "v3_ctc"
     punctuation_model_path: str | Path = "kontur-ai/sbert_punc_case_ru"
     preprocessing: str = "raw"
@@ -47,12 +54,13 @@ class Settings:
     max_audio_seconds: float = 4 * 60 * 60
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
     max_inflight_requests: int = 3
+    model_idle_seconds: int = 300
 
     def __post_init__(self) -> None:
         if self.host not in {"127.0.0.1", "localhost", "::1"}:
             raise SettingsError("LOCAL_ENGINE_HOST must be a loopback host")
-        if self.device not in {"cuda", "cpu"}:
-            raise SettingsError("LOCAL_ENGINE_DEVICE must be 'cuda' or 'cpu'")
+        if self.device not in {"mps", "cuda", "cpu"}:
+            raise SettingsError("LOCAL_ENGINE_DEVICE must be 'mps', 'cuda', or 'cpu'")
         if self.preprocessing not in {"raw", "afftdn"}:
             raise SettingsError("LOCAL_ENGINE_PREPROCESSING must be 'raw' or 'afftdn'")
         if not str(self.gigaam_model_path).strip():
@@ -65,17 +73,24 @@ class Settings:
             raise SettingsError(
                 "LOCAL_ENGINE_MAX_INFLIGHT_REQUESTS must be between 1 and 64"
             )
+        if (
+            type(self.model_idle_seconds) is not int
+            or not 0 <= self.model_idle_seconds <= 86400
+        ):
+            raise SettingsError(
+                "LOCAL_ENGINE_MODEL_IDLE_SECONDS must be an integer between 0 and 86400"
+            )
 
     @property
     def punctuation_dtype(self) -> str:
-        return "float16" if self.device == "cuda" else "float32"
+        return "float16" if self.device in {"mps", "cuda"} else "float32"
 
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
             host=os.environ.get("LOCAL_ENGINE_HOST", "127.0.0.1").strip(),
             port=_env_int("LOCAL_ENGINE_PORT", 8767, 1, 65535),
-            device=os.environ.get("LOCAL_ENGINE_DEVICE", "cuda").strip().lower(),
+            device=os.environ.get("LOCAL_ENGINE_DEVICE", _default_device()).strip().lower(),
             gigaam_model_path=os.environ.get("LOCAL_ENGINE_GIGAAM_MODEL", "v3_ctc").strip(),
             punctuation_model_path=os.environ.get(
                 "LOCAL_ENGINE_PUNCTUATION_MODEL", "kontur-ai/sbert_punc_case_ru"
@@ -92,6 +107,9 @@ class Settings:
             ),
             max_inflight_requests=_env_int(
                 "LOCAL_ENGINE_MAX_INFLIGHT_REQUESTS", 3, 1, 64
+            ),
+            model_idle_seconds=_env_int(
+                "LOCAL_ENGINE_MODEL_IDLE_SECONDS", 300, 0, 86400
             ),
             max_audio_seconds=_env_float(
                 "LOCAL_ENGINE_MAX_AUDIO_SECONDS", 4 * 60 * 60, 1.0, 24 * 60 * 60

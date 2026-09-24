@@ -1,0 +1,6 @@
+# Install this file, not requirements.txt, on the public coordinator host.
+fastapi>=0.115,<1
+pydantic>=2.7,<3
+uvicorn[standard]>=0.30,<1
+python-multipart>=0.0.9,<1
+httpx>=0.27,<1

@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from l0_draft_engine.app import create_app
 from l0_draft_engine.config import Settings
+from l0_draft_engine.engine import DraftEngine
 from l0_draft_engine.schemas import (
     DraftPayload,
     DraftResponse,
@@ -40,8 +41,12 @@ def wav_bytes(channels: int = 1, frames: int = 1600) -> bytes:
     return output.getvalue()
 
 
-class FakeEngine:
+class FakeEngine(DraftEngine):
     def __init__(self, *, hold_first_draft: bool = False) -> None:
+        super().__init__(
+            Settings(device="cpu", model_idle_seconds=0),
+            asr_factory=object,
+        )
         self.draft_calls = 0
         self.transcribe_calls = 0
         self.paths: list[Path] = []
@@ -52,9 +57,6 @@ class FakeEngine:
         self._draft_state_lock = threading.Lock()
         if not hold_first_draft:
             self.release_first_draft.set()
-
-    def health(self) -> dict[str, object]:
-        return {"ok": True, "device": "cuda", "models": {"loaded": False}}
 
     def draft(self, payload, paths) -> DraftResponse:
         with self._draft_state_lock:
@@ -170,8 +172,6 @@ async def test_health_does_not_load_models(tmp_path: Path) -> None:
         called = True
         raise AssertionError("health loaded a model")
 
-    from l0_draft_engine.engine import DraftEngine
-
     gigaam_path = tmp_path / "gigaam.ckpt"
     punctuation_path = tmp_path / "punctuation"
     gigaam_path.touch()
@@ -205,7 +205,7 @@ async def test_health_does_not_load_models(tmp_path: Path) -> None:
 async def test_draft_accepts_declared_colon_fields_and_cleans_temp_files() -> None:
     settings = Settings()
     engine = FakeEngine()
-    app = create_app(settings, engine)  # type: ignore[arg-type]
+    app = create_app(settings, engine)
     files = {
         "audio:1": ("first.wav", wav_bytes(), "audio/wav"),
         "audio:2": ("second.wav", wav_bytes(), "audio/wav"),
@@ -229,7 +229,7 @@ async def test_draft_accepts_declared_colon_fields_and_cleans_temp_files() -> No
 async def test_transcribe_uses_draft_multipart_contract_and_cleans_temp_files() -> None:
     settings = Settings()
     engine = FakeEngine()
-    app = create_app(settings, engine)  # type: ignore[arg-type]
+    app = create_app(settings, engine)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
@@ -268,7 +268,7 @@ async def test_transcribe_uses_draft_multipart_contract_and_cleans_temp_files() 
 async def test_draft_rejects_any_count_other_than_two_tracks() -> None:
     settings = Settings()
     engine = FakeEngine()
-    app = create_app(settings, engine)  # type: ignore[arg-type]
+    app = create_app(settings, engine)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
@@ -286,7 +286,7 @@ async def test_draft_rejects_any_count_other_than_two_tracks() -> None:
 async def test_invalid_payload_returns_a_json_serializable_422() -> None:
     settings = Settings()
     engine = FakeEngine()
-    app = create_app(settings, engine)  # type: ignore[arg-type]
+    app = create_app(settings, engine)
     invalid_payload = json.dumps(
         {
             "taskId": "task-1",
@@ -323,7 +323,7 @@ async def test_invalid_payload_returns_a_json_serializable_422() -> None:
 async def test_draft_rejects_stereo_track_before_inference() -> None:
     settings = Settings()
     engine = FakeEngine()
-    app = create_app(settings, engine)  # type: ignore[arg-type]
+    app = create_app(settings, engine)
     files = {
         "audio:1": ("first.wav", wav_bytes(channels=2), "audio/wav"),
         "audio:2": ("second.wav", wav_bytes(), "audio/wav"),
@@ -346,7 +346,7 @@ async def test_draft_rejects_stereo_track_before_inference() -> None:
 async def test_request_content_length_limit_is_enforced_before_form_parsing() -> None:
     settings = Settings()
     engine = FakeEngine()
-    app = create_app(settings, engine)  # type: ignore[arg-type]
+    app = create_app(settings, engine)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
@@ -365,7 +365,7 @@ async def test_request_content_length_limit_is_enforced_before_form_parsing() ->
 async def test_chunked_request_body_limit_cannot_be_bypassed() -> None:
     settings = Settings(max_track_bytes=1024, max_request_bytes=4096)
     engine = FakeEngine()
-    app = create_app(settings, engine)  # type: ignore[arg-type]
+    app = create_app(settings, engine)
 
     async def oversized_body():
         yield b"--boundary\r\nContent-Disposition: form-data; name=\"payload\"\r\n\r\n"
@@ -391,7 +391,7 @@ async def test_chunked_request_body_limit_cannot_be_bypassed() -> None:
 async def test_draft_requires_proxy_header() -> None:
     settings = Settings()
     engine = FakeEngine()
-    app = create_app(settings, engine)  # type: ignore[arg-type]
+    app = create_app(settings, engine)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
@@ -404,7 +404,7 @@ async def test_draft_requires_proxy_header() -> None:
 async def test_concurrent_draft_requests_wait_and_execute_one_at_a_time() -> None:
     settings = Settings()
     engine = FakeEngine(hold_first_draft=True)
-    app = create_app(settings, engine)  # type: ignore[arg-type]
+    app = create_app(settings, engine)
 
     async def post_draft(client: httpx.AsyncClient) -> httpx.Response:
         return await client.post(
@@ -442,7 +442,7 @@ async def test_concurrent_draft_requests_wait_and_execute_one_at_a_time() -> Non
 async def test_admission_rejects_a_fourth_request_before_body_parsing() -> None:
     settings = Settings(max_inflight_requests=3)
     engine = FakeEngine(hold_first_draft=True)
-    app = create_app(settings, engine)  # type: ignore[arg-type]
+    app = create_app(settings, engine)
 
     async def post_draft(
         client: httpx.AsyncClient, request_id: str
@@ -517,7 +517,7 @@ async def test_admission_rejects_a_fourth_request_before_body_parsing() -> None:
 async def test_admission_slot_recovers_after_invalid_and_completed_requests() -> None:
     settings = Settings(max_inflight_requests=1)
     engine = FakeEngine()
-    app = create_app(settings, engine)  # type: ignore[arg-type]
+    app = create_app(settings, engine)
 
     async def post_draft(
         client: httpx.AsyncClient, request_payload: str
@@ -549,7 +549,7 @@ async def test_admission_slot_recovers_after_invalid_and_completed_requests() ->
 async def test_queue_status_reports_running_position_and_completion() -> None:
     settings = Settings()
     engine = FakeEngine(hold_first_draft=True)
-    app = create_app(settings, engine)  # type: ignore[arg-type]
+    app = create_app(settings, engine)
 
     async def post_draft(client: httpx.AsyncClient, request_id: str) -> httpx.Response:
         return await client.post(
@@ -609,7 +609,7 @@ async def test_queue_status_reports_running_position_and_completion() -> None:
 async def test_draft_and_transcribe_share_one_inference_queue() -> None:
     settings = Settings()
     engine = FakeEngine(hold_first_draft=True)
-    app = create_app(settings, engine)  # type: ignore[arg-type]
+    app = create_app(settings, engine)
 
     async def post(client: httpx.AsyncClient, endpoint: str) -> httpx.Response:
         return await client.post(
@@ -652,7 +652,7 @@ async def test_draft_and_transcribe_share_one_inference_queue() -> None:
 @pytest.mark.anyio
 async def test_cors_allows_dashboard_and_loopback_origins_only() -> None:
     settings = Settings()
-    app = create_app(settings, FakeEngine())  # type: ignore[arg-type]
+    app = create_app(settings, FakeEngine())
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
@@ -668,7 +668,7 @@ async def test_cors_allows_dashboard_and_loopback_origins_only() -> None:
 
 @pytest.mark.anyio
 async def test_cors_preflight_allows_engine_request_headers() -> None:
-    app = create_app(Settings(), FakeEngine())  # type: ignore[arg-type]
+    app = create_app(Settings(), FakeEngine())
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
@@ -698,3 +698,138 @@ async def test_cors_preflight_allows_engine_request_headers() -> None:
         "x-babel-local-engine",
         "x-babel-request-id",
     } <= allowed_headers
+
+
+@pytest.mark.anyio
+async def test_accepted_upload_keeps_models_resident_until_request_finishes() -> None:
+    engine = FakeEngine()
+    with engine.model_session():
+        engine._get_asr()
+    app = create_app(Settings(), engine)
+    upload_started = asyncio.Event()
+    release_upload = asyncio.Event()
+
+    async def uploading_body():
+        upload_started.set()
+        await release_upload.wait()
+        yield b"--upload-end--\r\n"
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        request = asyncio.create_task(
+            client.post(
+                "/v1/draft",
+                content=uploading_body(),
+                headers={
+                    **PROXY_HEADERS,
+                    "Content-Type": "multipart/form-data; boundary=upload-end",
+                },
+            )
+        )
+        try:
+            await asyncio.wait_for(upload_started.wait(), timeout=2)
+            engine.close()
+            health = (await client.get("/health")).json()
+            assert health["models"]["asr"]["loaded"] is True
+        finally:
+            release_upload.set()
+            response = await request
+        assert response.status_code == 422
+        health = (await client.get("/health")).json()
+        assert health["models"]["asr"]["loaded"] is False
+
+
+@pytest.mark.parametrize("queue_second", [False, True])
+@pytest.mark.anyio
+async def test_cancellation_holds_models_until_last_worker_finishes(
+    queue_second: bool,
+) -> None:
+    second_started = threading.Event()
+    release_second = threading.Event()
+
+    class QueuedEngine(FakeEngine):
+        def draft(self, payload, paths):
+            if self.draft_calls == 1:
+                second_started.set()
+                if not release_second.wait(timeout=5):
+                    raise TimeoutError("test did not release the second draft")
+            assert self.model_summary()["asr"]["loaded"] is True
+            return super().draft(payload, paths)
+
+    engine = QueuedEngine(hold_first_draft=True)
+    with engine.model_session():
+        engine._get_asr()
+    app = create_app(Settings(), engine)
+    registered = asyncio.Event()
+    original_register = app.state.inference_queue.register
+
+    def register(request_id):
+        ticket = original_register(request_id)
+        if request_id == "waiting":
+            registered.set()
+        return ticket
+
+    app.state.inference_queue.register = register
+
+    async def post_draft(client, request_id):
+        return await client.post(
+            "/v1/draft",
+            data={"payload": payload()},
+            files={
+                "audio:1": ("first.wav", wav_bytes(), "audio/wav"),
+                "audio:2": ("second.wav", wav_bytes(), "audio/wav"),
+            },
+            headers={**PROXY_HEADERS, "X-Babel-Request-Id": request_id},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        first = asyncio.create_task(post_draft(client, "running"))
+        second = None
+        try:
+            assert await asyncio.to_thread(engine.first_draft_started.wait, 2)
+            if queue_second:
+                second = asyncio.create_task(post_draft(client, "waiting"))
+                await asyncio.wait_for(registered.wait(), timeout=2)
+                status = (await client.get("/v1/queue/waiting")).json()
+                assert status["status"] == "queued"
+            first.cancel()
+            await asyncio.sleep(0)
+            engine.close()
+            assert engine.model_summary()["asr"]["loaded"] is True
+            assert not first.done()
+
+            engine.release_first_draft.set()
+            if queue_second:
+                assert await asyncio.to_thread(second_started.wait, 2)
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            assert engine.model_summary()["asr"]["loaded"] is queue_second
+        finally:
+            engine.release_first_draft.set()
+            release_second.set()
+            results = await asyncio.gather(
+                *([first, second] if second is not None else [first]),
+                return_exceptions=True,
+            )
+        if queue_second:
+            assert results[1].status_code == 200
+        assert engine.model_summary()["asr"]["loaded"] is False
+
+
+@pytest.mark.anyio
+async def test_application_shutdown_releases_loaded_models() -> None:
+    engine = FakeEngine()
+    with engine.model_session():
+        engine._get_asr()
+    app = create_app(Settings(), engine)
+
+    async with app.router.lifespan_context(app):
+        assert engine.model_summary()["asr"]["loaded"] is True
+
+    assert engine.model_summary()["asr"]["loaded"] is False
+    with pytest.raises(RuntimeError):
+        with engine.model_session():
+            pytest.fail("shutdown engine accepted new work")

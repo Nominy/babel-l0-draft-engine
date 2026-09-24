@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import builtins
+import sys
 import tempfile
 import threading
 import time
 import uuid
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 import wave
 from unittest.mock import patch
+
+import pytest
 
 from l0_draft_engine.config import Settings
 from l0_draft_engine.engine import DraftEngine
@@ -58,6 +64,65 @@ class SpacedWordASR(FakeASR):
 class FakeFormatter:
     def format_rows(self, rows):
         return [" ".join(row) + "." for row in rows]
+
+
+class ControlledTimer:
+    def __init__(self, interval, function, args=None, kwargs=None) -> None:
+        self.function = function
+        self.args = args or ()
+        self.kwargs = kwargs or {}
+        self.cancelled = False
+
+    def start(self) -> None:
+        pass
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def fire(self) -> None:
+        # A canceled timer may already be executing its callback.
+        self.function(*self.args, **self.kwargs)
+
+
+@pytest.fixture(autouse=True)
+def idle_timers(monkeypatch):
+    timers: list[ControlledTimer] = []
+
+    def create_timer(*args, **kwargs):
+        timer = ControlledTimer(*args, **kwargs)
+        timers.append(timer)
+        return timer
+
+    monkeypatch.setattr("l0_draft_engine.engine.threading.Timer", create_timer)
+    return timers
+
+
+@pytest.fixture
+def lifecycle_engine(monkeypatch):
+    references: list[weakref.ReferenceType] = []
+
+    def create_asr():
+        model = FakeASR()
+        model.cycle = model
+        references.append(weakref.ref(model))
+        return model
+
+    def create_formatter():
+        model = FakeFormatter()
+        model.cycle = model
+        references.append(weakref.ref(model))
+        return model
+
+    monkeypatch.setattr("l0_draft_engine.engine.prepare_track", fake_prepare)
+    monkeypatch.setattr("l0_draft_engine.engine.segment_track", fake_segment)
+    monkeypatch.setattr("l0_draft_engine.engine.find_spec", lambda module: None)
+    engine = DraftEngine(
+        Settings(device="cpu", preprocessing="raw", model_idle_seconds=1),
+        asr_factory=create_asr,
+        formatter_factory=create_formatter,
+    )
+    yield engine, references
+    engine.close()
 
 
 def draft_payload(task_id: str = "task-1") -> DraftPayload:
@@ -304,9 +369,42 @@ def test_preserve_rows_keeps_live_boundaries_ids_and_empty_interval_fallback() -
     assert response.summary["preservedRows"] is True
 
 
-def test_gigaam_requires_explicit_cpu_setting() -> None:
-    assert Settings().device == "cuda"
-    assert Settings(device="cpu").device == "cpu"
+@pytest.mark.parametrize(
+    ("device", "mps_available", "cuda_available", "ready", "l2_dtype"),
+    [
+        ("mps", True, False, True, "float16"),
+        ("mps", False, True, False, "float16"),
+        ("cuda", True, False, False, "float16"),
+        ("cuda", False, True, True, "float16"),
+        ("cpu", False, False, True, "float32"),
+    ],
+)
+def test_health_checks_selected_backend(
+    monkeypatch,
+    device: str,
+    mps_available: bool,
+    cuda_available: bool,
+    ready: bool,
+    l2_dtype: str,
+) -> None:
+    torch = SimpleNamespace(
+        backends=SimpleNamespace(
+            mps=SimpleNamespace(is_available=lambda: mps_available)
+        ),
+        cuda=SimpleNamespace(is_available=lambda: cuda_available),
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setattr("l0_draft_engine.engine.find_spec", lambda module: object())
+    engine = DraftEngine(Settings(device=device))
+
+    health = engine.health()
+
+    assert health["ok"] is ready
+    assert health["models"]["asr"]["dtype"] == "float32"
+    assert health["models"]["asr"]["encoder_autocast_dtype"] == (
+        None if device == "cpu" else "float16"
+    )
+    assert health["models"]["l2"]["dtype"] == l2_dtype
 
 
 def test_health_is_not_ready_when_cached_models_are_missing(tmp_path: Path) -> None:
@@ -452,3 +550,193 @@ def test_gpu_inference_is_serialized_across_draft_and_transcribe() -> None:
     assert len(draft_response.rows) == 2
     assert sum(len(track.tokens) for track in transcribe_response.tracks) == 2
     assert asr.max_active == 1
+
+
+@pytest.mark.parametrize("operation", ["draft", "transcribe"])
+def test_idle_expiry_frees_models_and_next_inference_reloads(
+    lifecycle_engine, idle_timers, tmp_path: Path, operation: str
+) -> None:
+    engine, references = lifecycle_engine
+    infer = getattr(engine, operation)
+    first = infer(draft_payload(), audio_paths(tmp_path))
+    if operation == "draft":
+        assert [row.text for row in first.rows] == ["Угу.", "Привет."]
+    else:
+        assert [token.text for track in first.tracks for token in track.tokens] == [
+            "Угу", "Привет"
+        ]
+    models = engine.health()["models"]
+    assert models["asr"]["loaded"] is True
+    assert models["l2"]["loaded"] is (operation == "draft")
+    initially_loaded = len(references)
+
+    idle_timers[-1].fire()
+
+    assert all(not model["loaded"] for model in engine.health()["models"].values())
+    assert all(reference() is None for reference in references)
+    second = infer(draft_payload(), audio_paths(tmp_path))
+    if operation == "draft":
+        assert second.rows == first.rows
+    else:
+        assert second.tracks == first.tracks
+    assert len(references) == initially_loaded * 2
+    assert all(reference() is not None for reference in references[initially_loaded:])
+
+
+def test_nested_sessions_and_stale_callbacks_cannot_evict_refreshed_models(
+    lifecycle_engine, idle_timers, tmp_path: Path
+) -> None:
+    engine, references = lifecycle_engine
+    engine.draft(draft_payload(), audio_paths(tmp_path))
+    stale_timer = idle_timers[-1]
+
+    with engine.model_session():
+        with engine.model_session():
+            stale_timer.fire()
+            assert all(reference() is not None for reference in references)
+        stale_timer.fire()
+        assert all(reference() is not None for reference in references)
+        assert stale_timer.cancelled
+
+    current_timer = idle_timers[-1]
+    assert current_timer is not stale_timer
+    stale_timer.fire()
+    assert all(model["loaded"] for model in engine.health()["models"].values())
+    current_timer.fire()
+    assert all(reference() is None for reference in references)
+
+
+def test_waiting_session_keeps_models_after_running_session_finishes(
+    lifecycle_engine, idle_timers, tmp_path: Path
+) -> None:
+    engine, references = lifecycle_engine
+    engine.draft(draft_payload(), audio_paths(tmp_path))
+    stale_timer = idle_timers[-1]
+    waiting = threading.Event()
+    release = threading.Event()
+
+    def wait_then_transcribe():
+        with engine.model_session():
+            waiting.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("test did not release the waiting session")
+            return engine.transcribe(draft_payload(), audio_paths(tmp_path))
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            with engine.model_session():
+                future = pool.submit(wait_then_transcribe)
+                assert waiting.wait(timeout=2)
+            stale_timer.fire()
+            assert all(reference() is not None for reference in references)
+        finally:
+            release.set()
+        response = future.result(timeout=5)
+
+    assert response.summary["tokenCount"] == 2
+    idle_timers[-1].fire()
+    assert all(reference() is None for reference in references)
+
+
+def test_close_defers_release_until_last_session_and_forbids_new_work(
+    lifecycle_engine, idle_timers, tmp_path: Path
+) -> None:
+    engine, references = lifecycle_engine
+    engine.draft(draft_payload(), audio_paths(tmp_path))
+    stale_timer = idle_timers[-1]
+
+    with engine.model_session():
+        with engine.model_session():
+            engine.close()
+            engine.close()
+            stale_timer.fire()
+            assert all(reference() is not None for reference in references)
+            with pytest.raises(RuntimeError):
+                with engine.model_session():
+                    pytest.fail("a closed engine accepted new work")
+        assert all(reference() is not None for reference in references)
+
+    assert stale_timer.cancelled
+    assert all(reference() is None for reference in references)
+    assert all(not model["loaded"] for model in engine.health()["models"].values())
+    with pytest.raises(RuntimeError):
+        engine.transcribe(draft_payload(), audio_paths(tmp_path))
+
+
+@pytest.mark.parametrize("idle_seconds", [0, 1])
+def test_close_releases_idle_models_even_when_automatic_eviction_is_disabled(
+    monkeypatch, idle_timers, tmp_path: Path, idle_seconds: int
+) -> None:
+    monkeypatch.setattr("l0_draft_engine.engine.prepare_track", fake_prepare)
+    monkeypatch.setattr("l0_draft_engine.engine.segment_track", fake_segment)
+    engine = DraftEngine(
+        Settings(device="cpu", model_idle_seconds=idle_seconds),
+        asr_factory=FakeASR,
+        formatter_factory=FakeFormatter,
+    )
+    engine.draft(draft_payload(), audio_paths(tmp_path))
+    asr = weakref.ref(engine._asr)
+    formatter = weakref.ref(engine._formatter)
+    if idle_seconds == 0:
+        assert idle_timers == []
+
+    engine.close()
+    assert asr() is None
+    assert formatter() is None
+    assert all(timer.cancelled for timer in idle_timers)
+    for timer in idle_timers:
+        timer.fire()
+    with pytest.raises(RuntimeError):
+        with engine.model_session():
+            pytest.fail("a closed engine accepted new work")
+
+
+@pytest.mark.parametrize("device", ["mps", "cuda"])
+def test_idle_eviction_releases_models_before_clearing_selected_allocator(
+    lifecycle_engine, idle_timers, monkeypatch, tmp_path: Path, device: str
+) -> None:
+    engine, references = lifecycle_engine
+    engine.settings = Settings(device=device, model_idle_seconds=1)
+    cleared = []
+
+    def empty_cache(backend):
+        assert all(reference() is None for reference in references)
+        cleared.append(backend)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda: True)),
+            mps=SimpleNamespace(empty_cache=lambda: empty_cache("mps")),
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                empty_cache=lambda: empty_cache("cuda"),
+            ),
+        ),
+    )
+    engine.draft(draft_payload(), audio_paths(tmp_path))
+    idle_timers[-1].fire()
+    assert cleared == [device]
+
+
+def test_evicting_fake_models_does_not_import_torch(
+    lifecycle_engine, idle_timers, monkeypatch, tmp_path: Path
+) -> None:
+    engine, references = lifecycle_engine
+    engine.draft(draft_payload(), audio_paths(tmp_path))
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    original_import = builtins.__import__
+    torch_imports = []
+
+    def track_import(name, *args, **kwargs):
+        if name == "torch" or name.startswith("torch."):
+            torch_imports.append(name)
+            raise AssertionError("eviction must not initialize torch")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", track_import)
+    idle_timers[-1].fire()
+
+    assert all(reference() is None for reference in references)
+    assert torch_imports == []
