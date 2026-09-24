@@ -9,3 +9,7 @@ numpy<3,>=2
 
 [:python_version >= "3.13"]
 audioop-lts>=0.2.1
+
+[:sys_platform == "darwin" and platform_machine == "arm64"]
+torch>=2.14
+torchaudio>=2.11

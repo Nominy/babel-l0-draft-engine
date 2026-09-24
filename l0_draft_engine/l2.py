@@ -43,7 +43,7 @@ class PunctuationFormatter:
             model = AutoModelForTokenClassification.from_pretrained(
                 self.model, local_files_only=local_only
             )
-            if self.device == "cuda":
+            if self.device in {"mps", "cuda"}:
                 model = model.half()
             model = model.to(self.device)
             model.eval()

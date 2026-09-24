@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 from bisect import bisect_left
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.util import find_spec
+import gc
+import logging
 import math
 import re
+import sys
 import tempfile
 import threading
 import time
 import uuid
 import wave
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +42,7 @@ from .schemas import (
 ROW_NAMESPACE = uuid.UUID("54057e89-dfb6-5f31-925d-6119e48bdac4")
 TOKEN_NAMESPACE = uuid.UUID("a7517066-1d3b-52f5-a6f9-6a38a59ffde7")
 MARKUP_RE = re.compile(r"\[[^\[\]\r\n]+\]|</?[^<>\r\n]+>|\{[^{}\r\n]+\}")
+logger = logging.getLogger(__name__)
 
 
 class DraftInputError(ValueError):
@@ -83,6 +88,84 @@ class DraftEngine:
         self._asr: Any | None = None
         self._formatter: Any | None = None
         self._gpu_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._active_sessions = 0
+        self._closed = False
+        self._idle_timer: threading.Timer | None = None
+        self._idle_generation = 0
+
+    def _cancel_idle_timer(self) -> None:
+        self._idle_generation += 1
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+
+    @contextmanager
+    def model_session(self) -> Iterator[None]:
+        """Keep models resident through upload, queueing, and inference."""
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("engine is closed")
+            self._cancel_idle_timer()
+            self._active_sessions += 1
+        try:
+            yield
+        finally:
+            with self._state_lock:
+                self._active_sessions -= 1
+                if self._active_sessions == 0:
+                    if self._closed:
+                        self._unload_models()
+                    elif (
+                        self.settings.model_idle_seconds > 0
+                        and (self._asr is not None or self._formatter is not None)
+                    ):
+                        timer = threading.Timer(
+                            self.settings.model_idle_seconds,
+                            self._evict_idle_models,
+                            args=(self._idle_generation,),
+                        )
+                        timer.daemon = True
+                        self._idle_timer = timer
+                        timer.start()
+
+    def _evict_idle_models(self, generation: int) -> None:
+        with self._state_lock:
+            if (
+                self._closed
+                or self._active_sessions
+                or generation != self._idle_generation
+            ):
+                return
+            self._idle_timer = None
+            self._unload_models()
+
+    def _unload_models(self) -> None:
+        # Caller holds the state lock; inference releases GPU before session exit.
+        with self._gpu_lock:
+            if self._asr is None and self._formatter is None:
+                return
+            self._asr = None
+            self._formatter = None
+            gc.collect()
+            torch = sys.modules.get("torch")
+            if torch is not None:
+                if (
+                    self.settings.device == "mps"
+                    and torch.backends.mps.is_available()
+                ):
+                    torch.mps.empty_cache()
+                elif self.settings.device == "cuda" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            logger.info("Unloaded idle inference models from %s", self.settings.device)
+
+    def close(self) -> None:
+        """Reject new sessions and release models once accepted work finishes."""
+        with self._state_lock:
+            self._closed = True
+            self._cancel_idle_timer()
+            if self._active_sessions == 0:
+                self._unload_models()
 
     def _load_asr(self) -> Any:
         try:
@@ -155,6 +238,10 @@ class DraftEngine:
             "asr": {
                 "name": asr_reference,
                 "device": self.settings.device,
+                "dtype": "float32",
+                "encoder_autocast_dtype": (
+                    None if self.settings.device == "cpu" else "float16"
+                ),
                 "loaded": self._asr is not None,
                 "cached": self._asr_cached(),
                 "checkpoint": Path(asr_reference).name,
@@ -182,7 +269,12 @@ class DraftEngine:
             try:
                 import torch
 
-                device_available = self.settings.device == "cpu" or torch.cuda.is_available()
+                if self.settings.device == "mps":
+                    device_available = torch.backends.mps.is_available()
+                elif self.settings.device == "cuda":
+                    device_available = torch.cuda.is_available()
+                else:
+                    device_available = self.settings.device == "cpu"
             except Exception:
                 device_available = False
         return {
@@ -444,7 +536,7 @@ class DraftEngine:
         preprocess_finished = time.perf_counter()
 
         wait_started = time.perf_counter()
-        with self._gpu_lock:
+        with self.model_session(), self._gpu_lock:
             inference_started = time.perf_counter()
             model = self._get_asr()
             words_by_lane = {
@@ -454,6 +546,7 @@ class DraftEngine:
                 for lane in expected_lanes
             }
             asr_finished = time.perf_counter()
+            del model
 
         response_tracks: list[TranscriptionTrack] = []
         for lane in expected_lanes:
@@ -520,7 +613,7 @@ class DraftEngine:
         preprocess_finished = time.perf_counter()
 
         wait_started = time.perf_counter()
-        with self._gpu_lock:
+        with self.model_session(), self._gpu_lock:
             inference_started = time.perf_counter()
             model = self._get_asr()
             words_by_lane = {
@@ -535,6 +628,7 @@ class DraftEngine:
             )
             formatted = self._format_candidates(candidates)
             inference_finished = time.perf_counter()
+            del model
 
         if payload.options is not None and payload.options.preserveRows is not None:
             candidates = sorted(

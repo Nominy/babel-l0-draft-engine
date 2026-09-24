@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 import json
 import re
 import tempfile
@@ -236,7 +237,17 @@ def create_app(
     admission_gate = _EventLoopAdmissionGate(
         resolved_settings.max_inflight_requests
     )
-    service = FastAPI(title="Babel Local Drafting Engine", version="1.0.0")
+
+    @asynccontextmanager
+    async def lifespan(_service: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            await run_in_threadpool(resolved_engine.close)
+
+    service = FastAPI(
+        title="Babel Local Drafting Engine", version="1.0.0", lifespan=lifespan
+    )
     service.add_middleware(
         RequestSizeLimitMiddleware, max_bytes=resolved_settings.max_request_bytes
     )
@@ -293,72 +304,73 @@ def create_app(
 
         uploads: list[StarletteUploadFile] = []
         try:
-            try:
-                form = await request.form()
-            except RequestBodyTooLarge:
-                raise
-            except HTTPException:
-                raise
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=400, detail="invalid multipart request"
-                ) from exc
-            uploads = [
-                value
-                for _, value in form.multi_items()
-                if isinstance(value, StarletteUploadFile)
-            ]
-            payload, files = _parse_form(form)
-            with tempfile.TemporaryDirectory(prefix="babel-local-engine-") as temporary:
-                directory = Path(temporary)
-                paths: dict[str, Path] = {}
-                for index, track in enumerate(payload.tracks):
-                    destination = directory / f"track-{index}.wav"
-                    upload = files[track.fieldName]
-                    await _copy_upload(
-                        upload,
-                        destination,
-                        resolved_settings.max_track_bytes,
-                    )
-                    await upload.close()
-                    uploads.remove(upload)
-                    _validate_mono_wav(
-                        destination, resolved_settings.max_audio_seconds
-                    )
-                    paths[track.lane] = destination
-
+            with resolved_engine.model_session():
                 try:
-                    ticket = inference_queue.register(request_id)
-                except DuplicateRequestIdError as exc:
+                    form = await request.form()
+                except RequestBodyTooLarge:
+                    raise
+                except HTTPException:
+                    raise
+                except Exception as exc:
                     raise HTTPException(
-                        status_code=409, detail="request ID is already registered"
+                        status_code=400, detail="invalid multipart request"
                     ) from exc
-                try:
-                    await ticket.ready.wait()
-                except BaseException:
-                    inference_queue.abandon(ticket)
-                    raise
+                uploads = [
+                    value
+                    for _, value in form.multi_items()
+                    if isinstance(value, StarletteUploadFile)
+                ]
+                payload, files = _parse_form(form)
+                with tempfile.TemporaryDirectory(prefix="babel-local-engine-") as temporary:
+                    directory = Path(temporary)
+                    paths: dict[str, Path] = {}
+                    for index, track in enumerate(payload.tracks):
+                        destination = directory / f"track-{index}.wav"
+                        upload = files[track.fieldName]
+                        await _copy_upload(
+                            upload,
+                            destination,
+                            resolved_settings.max_track_bytes,
+                        )
+                        await upload.close()
+                        uploads.remove(upload)
+                        _validate_mono_wav(
+                            destination, resolved_settings.max_audio_seconds
+                        )
+                        paths[track.lane] = destination
 
-                try:
-                    worker = asyncio.create_task(
-                        run_in_threadpool(inference, payload, paths)
-                    )
-                except BaseException:
-                    inference_queue.abandon(ticket)
-                    raise
-                try:
                     try:
-                        return await asyncio.shield(worker)
-                    except asyncio.CancelledError as exc:
-                        await _finish_cancelled_worker(worker)
-                        raise exc
-                except DraftInputError as exc:
-                    raise HTTPException(status_code=422, detail=str(exc)) from exc
-                except ModelUnavailableError as exc:
-                    raise HTTPException(status_code=503, detail=str(exc)) from exc
-                finally:
-                    if worker.done():
-                        inference_queue.complete(ticket)
+                        ticket = inference_queue.register(request_id)
+                    except DuplicateRequestIdError as exc:
+                        raise HTTPException(
+                            status_code=409, detail="request ID is already registered"
+                        ) from exc
+                    try:
+                        await ticket.ready.wait()
+                    except BaseException:
+                        inference_queue.abandon(ticket)
+                        raise
+
+                    try:
+                        worker = asyncio.create_task(
+                            run_in_threadpool(inference, payload, paths)
+                        )
+                    except BaseException:
+                        inference_queue.abandon(ticket)
+                        raise
+                    try:
+                        try:
+                            return await asyncio.shield(worker)
+                        except asyncio.CancelledError as exc:
+                            await _finish_cancelled_worker(worker)
+                            raise exc
+                    except DraftInputError as exc:
+                        raise HTTPException(status_code=422, detail=str(exc)) from exc
+                    except ModelUnavailableError as exc:
+                        raise HTTPException(status_code=503, detail=str(exc)) from exc
+                    finally:
+                        if worker.done():
+                            inference_queue.complete(ticket)
         finally:
             try:
                 cleanup = asyncio.create_task(_close_uploads(uploads))
