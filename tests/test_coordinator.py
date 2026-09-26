@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -86,14 +87,15 @@ def settings(**changes: object) -> CoordinatorSettings:
 
 
 async def submit(client: httpx.AsyncClient, operation: str, request_id: str,
-                 *, task_id: str = "task-1", first: bytes | None = None) -> httpx.Response:
+                 *, task_id: str = "task-1", first: bytes | None = None,
+                 token: str = TOKEN, request_payload: dict[str, object] | None = None) -> httpx.Response:
     return await client.post(
         f"/v1/{operation}",
-        data={"payload": json.dumps(payload(task_id))},
+        data={"payload": json.dumps(payload(task_id) if request_payload is None else request_payload)},
         files={"audio:1": ("first.wav", first if first is not None else wav_bytes(), "audio/wav"),
                "audio:2": ("second.wav", wav_bytes(), "audio/wav")},
         headers={"X-Babel-Local-Engine": "1", "X-Babel-Request-Id": request_id,
-                 "Authorization": f"Bearer {TOKEN}"},
+                 "Authorization": f"Bearer {token}"},
     )
 
 
@@ -151,16 +153,20 @@ async def test_timing_first_inflight_join_arbitrary_worker_and_reload_cache() ->
             "/v1/timing/lookup", json={"taskId": task_id},
             headers={"Authorization": f"Bearer {TOKEN}"},
         ))
+        pending_repeat = asyncio.create_task(submit(client, "transcribe", "joined", task_id=task_id))
         await asyncio.sleep(0)
-        assert not pending_draft.done() and not pending_lookup.done()
+        assert not pending_draft.done() and not pending_lookup.done() and not pending_repeat.done()
         assert (await client.post(f"/v1/jobs/{lease['jobId']}/complete", json={
             **first_worker, "leaseToken": lease["leaseToken"],
             "result": timing_result(task_id),
         })).status_code == 200
-        timing, lookup = await asyncio.wait_for(asyncio.gather(first, pending_lookup), timeout=3)
-        assert timing.status_code == lookup.status_code == 200
+        timing, lookup, repeated = await asyncio.wait_for(
+            asyncio.gather(first, pending_lookup, pending_repeat), timeout=3
+        )
+        assert timing.status_code == lookup.status_code == repeated.status_code == 200
         assert timing.json() == {**timing_result(task_id), "accessToken": TOKEN}
         assert lookup.json() == timing.json()
+        assert repeated.json() == timing.json()
         draft_lease = (await client.post("/v1/workers/lease", json=second_worker)).json()
         assert (await client.post("/v1/workers/lease", json=first_worker)).status_code == 204
         assert draft_lease["operation"] == "draft"
@@ -185,6 +191,148 @@ async def test_timing_first_inflight_join_arbitrary_worker_and_reload_cache() ->
         assert (await submit(client, "transcribe", "collision", task_id=task_id,
                              first=changed_audio)).status_code == 409
     assert fallback_calls == []
+    await upstream.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("first_completed", [False, True], ids=["inflight", "cached"])
+async def test_capabilities_transcribe_same_task_independently(first_completed: bool) -> None:
+    def backend(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.startswith("/v1/queue/"):
+            return httpx.Response(404)
+        raise AssertionError("timing must come from the matching volunteer or private cache")
+
+    upstream = httpx.AsyncClient(transport=httpx.MockTransport(backend))
+    app = create_app(settings(), client=upstream)
+    second_result = timing_result()
+    second_result["tracks"][0]["tokens"][0]["text"] = "Другой"
+    expected = {
+        TOKEN: {**timing_result(), "accessToken": TOKEN},
+        OTHER_TOKEN: {**second_result, "accessToken": OTHER_TOKEN},
+    }
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://coordinator") as client:
+        first_worker = await register(client)
+        second_worker = await register(client)
+        first = asyncio.create_task(submit(client, "transcribe", "first-capability"))
+        await wait_for_status(client, "first-capability")
+        first_lease = (await client.post("/v1/workers/lease", json=first_worker)).json()
+        if first_completed:
+            assert (await client.post(f"/v1/jobs/{first_lease['jobId']}/complete", json={
+                **first_worker, "leaseToken": first_lease["leaseToken"], "result": timing_result(),
+            })).status_code == 200
+            assert (await first).json() == expected[TOKEN]
+
+        assert (await client.post("/v1/timing/lookup", json={"taskId": "task-1"},
+                                  headers={"Authorization": f"Bearer {OTHER_TOKEN}"})).status_code == 404
+        assert (await draft(client, "unauthorized", token=OTHER_TOKEN)).status_code == 404
+        second = asyncio.create_task(submit(client, "transcribe", "second-capability", token=OTHER_TOKEN))
+        await wait_for_status(client, "second-capability")
+        second_lease = (await client.post("/v1/workers/lease", json=second_worker)).json()
+        assert (await client.post(f"/v1/jobs/{second_lease['jobId']}/complete", json={
+            **second_worker, "leaseToken": second_lease["leaseToken"], "result": second_result,
+        })).status_code == 200
+        assert (await second).json() == expected[OTHER_TOKEN]
+
+        if not first_completed:
+            pending_lookup = asyncio.create_task(client.post(
+                "/v1/timing/lookup", json={"taskId": "task-1"},
+                headers={"Authorization": f"Bearer {TOKEN}"},
+            ))
+            await asyncio.sleep(0)
+            assert not pending_lookup.done()
+            assert (await client.post(f"/v1/jobs/{first_lease['jobId']}/complete", json={
+                **first_worker, "leaseToken": first_lease["leaseToken"], "result": timing_result(),
+            })).status_code == 200
+            first_response, first_lookup = await asyncio.wait_for(
+                asyncio.gather(first, pending_lookup), timeout=3
+            )
+            assert first_response.json() == first_lookup.json() == expected[TOKEN]
+
+    reloaded = create_app(settings(), client=upstream)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=reloaded), base_url="http://coordinator") as client:
+        for index, (token, result) in enumerate(expected.items()):
+            lookup = await client.post("/v1/timing/lookup", json={"taskId": "task-1"},
+                                       headers={"Authorization": f"Bearer {token}"})
+            assert lookup.status_code == 200
+            assert lookup.json() == result
+            repeated = await submit(client, "transcribe", f"repeat-{index}", token=token)
+            assert repeated.status_code == 200
+            assert repeated.json() == result
+        assert (await client.post("/v1/timing/lookup", json={"taskId": "task-1"},
+                                  headers={"Authorization": f"Bearer {'c' * 43}"})).status_code == 404
+        assert (await draft(client, "unknown-capability", token="c" * 43)).status_code == 404
+    await upstream.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("change", ["audio", "lane", "lane-order", "preprocessing", "preprocessing-default"])
+async def test_changed_transcription_input_conflicts_inflight_and_cached(change: str) -> None:
+    def backend(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.startswith("/v1/queue/"):
+            return httpx.Response(404)
+        raise AssertionError("mismatched input must not dispatch another job")
+
+    upstream = httpx.AsyncClient(transport=httpx.MockTransport(backend))
+    app = create_app(settings(), client=upstream)
+    original = {**payload(), "options": {"preprocessing": "raw"}}
+    changed = json.loads(json.dumps(original))
+    changed_audio = None
+    if change == "audio":
+        changed_audio = wav_bytes()[:-2] + b"\x02\x01"
+    elif change == "lane":
+        changed["tracks"][0]["lane"] = "another-speaker"
+    elif change == "lane-order":
+        changed["tracks"].reverse()
+    elif change == "preprocessing":
+        changed["options"]["preprocessing"] = "afftdn"
+    else:
+        del changed["options"]
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://coordinator") as client:
+        worker = await register(client)
+        first = asyncio.create_task(submit(client, "transcribe", "original", request_payload=original))
+        await wait_for_status(client, "original")
+        lease = (await client.post("/v1/workers/lease", json=worker)).json()
+        inflight = await asyncio.wait_for(submit(
+            client, "transcribe", "changed-inflight", first=changed_audio, request_payload=changed,
+        ), timeout=2)
+        assert inflight.status_code == 409
+        assert (await client.post(f"/v1/jobs/{lease['jobId']}/complete", json={
+            **worker, "leaseToken": lease["leaseToken"], "result": timing_result(),
+        })).status_code == 200
+        assert (await first).status_code == 200
+        cached = await submit(client, "transcribe", "changed-cached",
+                              first=changed_audio, request_payload=changed)
+        assert cached.status_code == 409
+        repeated = await submit(client, "transcribe", "unchanged", request_payload=original)
+        assert repeated.status_code == 200
+        assert repeated.json() == {**timing_result(), "accessToken": TOKEN}
+    await upstream.aclose()
+
+
+@pytest.mark.anyio
+async def test_legacy_task_only_cache_is_invalidated_before_retranscription(tmp_path: Path) -> None:
+    legacy = tmp_path / f"{hashlib.sha256(b'task-1').hexdigest()}.json"
+    legacy.write_text(json.dumps({
+        "taskId": "task-1", "tokenDigest": hashlib.sha256(TOKEN.encode()).hexdigest(),
+        "audioDigests": [hashlib.sha256(wav_bytes()).hexdigest()] * 2,
+        "timing": timing_result(),
+    }), encoding="utf-8")
+    refreshed = timing_result()
+    refreshed["tracks"][0]["tokens"][0]["text"] = "Обновлено"
+
+    def backend(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=refreshed)
+
+    upstream = httpx.AsyncClient(transport=httpx.MockTransport(backend))
+    app = create_app(settings(), client=upstream)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://coordinator") as client:
+        lookup = await client.post("/v1/timing/lookup", json={"taskId": "task-1"},
+                                   headers={"Authorization": f"Bearer {TOKEN}"})
+        assert lookup.status_code == 404
+        assert not legacy.exists()
+        response = await submit(client, "transcribe", "fresh")
+        assert response.status_code == 200
+        assert response.json() == {**refreshed, "accessToken": TOKEN}
     await upstream.aclose()
 
 
@@ -394,13 +542,17 @@ async def test_multipart_and_body_limits_prevent_dispatch() -> None:
 
 def test_timing_cache_rotates_under_byte_limit_and_keeps_private_records(tmp_path: Path) -> None:
     cache = TimingCache(tmp_path / "timing", 4 * 1024**3)
-    first = TranscriptionResponse.model_validate(timing_result("first/path"))
+    first = TranscriptionResponse.model_validate({**timing_result("first/path"), "accessToken": TOKEN})
     second = TranscriptionResponse.model_validate(timing_result("second/path"))
-    digest = ("audio-first", "audio-second")
+    digest = "1" * 64
     cache.put(first, TOKEN, digest)
     assert cache.get(first.taskId, OTHER_TOKEN) is None
-    assert cache.get(first.taskId, TOKEN, ("different-audio", digest[1])) is None
-    first_size = cache._path(first.taskId).stat().st_size
+    assert cache.get(first.taskId, TOKEN, "2" * 64) is None
+    first_path = next(cache.directory.glob("*.json"))
+    record = first_path.read_text(encoding="utf-8")
+    assert f'"{TOKEN}"' not in record
+    assert "accessToken" not in json.loads(record)["timing"]
+    first_size = first_path.stat().st_size
     cache.max_bytes = first_size + first_size // 2
     cache.put(second, TOKEN, digest)
     assert cache.get(first.taskId, TOKEN) is None

@@ -273,27 +273,44 @@ class CompleteBody(WorkerBody):
         return self
 
 
+def _timing_key(task_id: str, token: str) -> tuple[str, str]:
+    return task_id, hashlib.sha256(token.encode()).hexdigest()
+
+
+def _timing_input_digest(payload: DraftPayload, audio_digests: tuple[str, ...]) -> str:
+    identity = {
+        "tracks": [(track.lane, digest) for track, digest in zip(payload.tracks, audio_digests, strict=True)],
+        "preprocessing": payload.options.preprocessing if payload.options is not None else None,
+    }
+    return hashlib.sha256(json.dumps(identity, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
 @dataclass
 class TimingFlight:
-    token_digest: str
-    audio_digests: tuple[str, ...]
+    input_digest: str
     result: asyncio.Future[TranscriptionResponse | None]
 
 
 class TimingCache:
-    """Private, on-disk LRU of completed timing results keyed by task identity."""
+    """Private, on-disk LRU keyed by task ID and bearer capability digest."""
 
     def __init__(self, directory: Path, max_bytes: int) -> None:
         self.directory = directory
         self.max_bytes = max_bytes
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # The task-only format cannot prove lanes or preprocessing; never migrate it.
+        for path in directory.glob("*.json"):
+            if re.fullmatch(r"[0-9a-f]{64}\.json", path.name):
+                path.unlink(missing_ok=True)
         self._rotate()
 
-    def _path(self, task_id: str) -> Path:
-        return self.directory / f"{hashlib.sha256(task_id.encode()).hexdigest()}.json"
+    def _path(self, key: tuple[str, str]) -> Path:
+        digest = hashlib.sha256(json.dumps(key, separators=(",", ":")).encode()).hexdigest()
+        return self.directory / f"v2-{digest}.json"
 
-    def get(self, task_id: str, token: str, audio_digests: tuple[str, ...] | None = None) -> TranscriptionResponse | None:
-        path = self._path(task_id)
+    def get(self, task_id: str, token: str, input_digest: str | None = None) -> TranscriptionResponse | None:
+        key = _timing_key(task_id, token)
+        path = self._path(key)
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -304,19 +321,20 @@ class TimingCache:
         try:
             timing = TranscriptionResponse.model_validate(record["timing"])
             if (
-                record["taskId"] != task_id or timing.taskId != task_id
+                record["version"] != 2
+                or record["taskId"] != task_id or timing.taskId != task_id
                 or not isinstance(record["tokenDigest"], str)
-                or not isinstance(record["audioDigests"], list)
+                or not re.fullmatch(r"[0-9a-f]{64}", record["tokenDigest"])
+                or not isinstance(record["inputDigest"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", record["inputDigest"])
             ):
                 raise ValueError("invalid timing cache record")
         except (ValueError, KeyError, TypeError, ValidationError):
             path.unlink(missing_ok=True)
             return None
-        if not secrets.compare_digest(
-            record["tokenDigest"], hashlib.sha256(token.encode()).hexdigest()
-        ):
+        if not secrets.compare_digest(record["tokenDigest"], key[1]):
             return None
-        if audio_digests is not None and record["audioDigests"] != list(audio_digests):
+        if input_digest is not None and record["inputDigest"] != input_digest:
             return None
         try:
             os.utime(path)
@@ -324,11 +342,13 @@ class TimingCache:
             return None
         return timing.model_copy(update={"accessToken": token})
 
-    def put(self, timing: TranscriptionResponse, token: str, audio_digests: tuple[str, ...]) -> None:
+    def put(self, timing: TranscriptionResponse, token: str, input_digest: str) -> None:
+        key = _timing_key(timing.taskId, token)
         data = json.dumps({
+            "version": 2,
             "taskId": timing.taskId,
-            "tokenDigest": hashlib.sha256(token.encode()).hexdigest(),
-            "audioDigests": audio_digests,
+            "tokenDigest": key[1],
+            "inputDigest": input_digest,
             "timing": timing.model_dump(exclude={"accessToken"}),
         }, ensure_ascii=False, allow_nan=False).encode("utf-8")
         if len(data) > self.max_bytes:
@@ -343,13 +363,13 @@ class TimingCache:
                 temporary_path.unlink(missing_ok=True)
                 raise
         try:
-            os.replace(temporary_path, self._path(timing.taskId))
+            os.replace(temporary_path, self._path(key))
             self._rotate()
         finally:
             temporary_path.unlink(missing_ok=True)
 
-    def exists(self, task_id: str) -> bool:
-        return self._path(task_id).exists()
+    def exists(self, task_id: str, token: str) -> bool:
+        return self._path(_timing_key(task_id, token)).exists()
 
     def _rotate(self) -> None:
         entries = sorted(
@@ -397,7 +417,7 @@ class Coordinator:
         self.settings = settings
         self.client = client
         self.cache = TimingCache(settings.cache_dir, settings.cache_max_bytes)
-        self.timing_flights: dict[str, TimingFlight] = {}
+        self.timing_flights: dict[tuple[str, str], TimingFlight] = {}
         self.workers: dict[str, Worker] = {}
         self.jobs: dict[str, Job] = {}
         self.by_request_id: dict[str, Job] = {}
@@ -770,10 +790,8 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
         cached = state.cache.get(task_id, token)
         if cached is not None:
             return cached
-        flight = state.timing_flights.get(task_id)
-        if flight is None or not secrets.compare_digest(
-            flight.token_digest, hashlib.sha256(token.encode()).hexdigest()
-        ):
+        flight = state.timing_flights.get(_timing_key(task_id, token))
+        if flight is None:
             return None
         remaining = (
             resolved.request_timeout_seconds if deadline is None
@@ -866,18 +884,17 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
                     paths[track.fieldName] = path
                     filenames[track.fieldName] = upload.filename or f"track-{index}.wav"
                     types[track.fieldName] = upload.content_type or "audio/wav"
-                identity = tuple(audio_digests)
+                identity = _timing_input_digest(payload, tuple(audio_digests))
                 cached = state.cache.get(payload.taskId, token, identity)
                 if cached is not None:
                     return cached
-                if state.cache.exists(payload.taskId):
-                    raise HTTPException(409, "task ID already belongs to different audio or credentials")
-                flight = state.timing_flights.get(payload.taskId)
+                if state.cache.exists(payload.taskId, token):
+                    raise HTTPException(409, "task ID already belongs to different transcription input")
+                key = _timing_key(payload.taskId, token)
+                flight = state.timing_flights.get(key)
                 if flight is not None:
-                    if flight.audio_digests != identity or not secrets.compare_digest(
-                        flight.token_digest, hashlib.sha256(token.encode()).hexdigest()
-                    ):
-                        raise HTTPException(409, "task ID already belongs to different audio or credentials")
+                    if flight.input_digest != identity:
+                        raise HTTPException(409, "task ID already belongs to different transcription input")
                     try:
                         result = await asyncio.wait_for(
                             asyncio.shield(flight.result), timeout=max(0, deadline - time.monotonic())
@@ -888,10 +905,10 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
                         raise HTTPException(503, "timing request failed")
                     return result.model_copy(update={"accessToken": token})
                 flight = TimingFlight(
-                    hashlib.sha256(token.encode()).hexdigest(), identity,
+                    identity,
                     asyncio.get_running_loop().create_future(),
                 )
-                state.timing_flights[payload.taskId] = flight
+                state.timing_flights[key] = flight
                 try:
                     job = Job(request_id, "transcribe", payload, raw_payload,
                               paths, filenames, types, asyncio.get_running_loop().create_future())
@@ -910,7 +927,7 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
                 finally:
                     if not flight.result.done():
                         flight.result.set_result(None)
-                    state.timing_flights.pop(payload.taskId, None)
+                    state.timing_flights.pop(key, None)
         finally:
             try:
                 await asyncio.gather(*(upload.close() for upload in uploads), return_exceptions=True)
