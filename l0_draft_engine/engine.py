@@ -31,9 +31,11 @@ from .config import Settings
 from .gigaam_asr import GigaAMRecognizer
 from .l2 import PunctuationFormatter
 from .schemas import (
+    DraftOptions,
     DraftPayload,
     DraftResponse,
     DraftRow,
+    TimingSegment,
     TranscriptionResponse,
     TranscriptionToken,
     TranscriptionTrack,
@@ -46,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 
 class DraftInputError(ValueError):
-    """Raised when valid multipart input contains unusable audio."""
+    """Raised when audio or cached timing cannot produce trustworthy draft rows."""
 
 
 class ModelUnavailableError(RuntimeError):
@@ -579,7 +581,23 @@ class DraftEngine:
                 )
                 for token_index, word in enumerate(lane_words)
             ]
-            response_tracks.append(TranscriptionTrack(lane=lane, tokens=tokens))
+            response_tracks.append(TranscriptionTrack(
+                lane=lane,
+                tokens=tokens,
+                segments=[
+                    TimingSegment(
+                        id=segment.id,
+                        startSeconds=segment.start_seconds,
+                        endSeconds=segment.end_seconds,
+                        startSample=segment.start_sample,
+                        endSample=segment.end_sample,
+                        sampleRate=segment.sample_rate,
+                    )
+                    for segment in coarse_by_lane[lane]
+                ],
+                pcmSha256=track.pcm_sha256,
+                sampleRate=track.sample_rate,
+            ))
 
         finished = time.perf_counter()
         return TranscriptionResponse(
@@ -601,46 +619,52 @@ class DraftEngine:
             models={"asr": self.model_summary()["asr"]},
         )
 
-    def draft(self, payload: DraftPayload, audio_paths: dict[str, Path]) -> DraftResponse:
+    def draft(self, timing: TranscriptionResponse, options: DraftOptions | None = None) -> DraftResponse:
         started = time.perf_counter()
-        (
-            preprocessing,
-            expected_lanes,
-            tracks,
-            coarse_by_lane,
-            diagnostics,
-        ) = self._prepare_audio(payload, audio_paths)
-        preprocess_finished = time.perf_counter()
-
-        wait_started = time.perf_counter()
+        payload = DraftPayload(
+            taskId=timing.taskId,
+            tracks=[
+                {"lane": track.lane, "fieldName": f"audio:{index}"}
+                for index, track in enumerate(timing.tracks)
+            ],
+            options=options,
+        )
+        tracks = {
+            track.lane: AudioTrack(
+                lane=track.lane, source_path="", derived_path="",
+                sample_rate=track.sampleRate, frame_count=0,
+                source_sha256="", pcm_sha256=track.pcmSha256,
+            )
+            for track in timing.tracks
+        }
+        segments = {
+            track.lane: [
+                Segment(
+                    id=segment.id, lane=track.lane, stage="s2",
+                    start_sample=segment.startSample, end_sample=segment.endSample,
+                    sample_rate=segment.sampleRate,
+                )
+                for segment in track.segments
+            ]
+            for track in timing.tracks
+        }
+        words = {
+            track.lane: [
+                Word(token.startSeconds, token.endSeconds, token.text)
+                for token in track.tokens
+            ]
+            for track in timing.tracks
+        }
         with self.model_session(), self._gpu_lock:
             inference_started = time.perf_counter()
-            model = self._get_asr()
-            words_by_lane = {
-                lane: self._transcribe_lane(
-                    model, tracks[lane], coarse_by_lane[lane]
-                )
-                for lane in expected_lanes
-            }
-            asr_finished = time.perf_counter()
-            candidates = self._group_rows(
-                payload, tracks, coarse_by_lane, words_by_lane
-            )
+            candidates = self._group_rows(payload, tracks, segments, words)
             formatted = self._format_candidates(candidates)
             inference_finished = time.perf_counter()
-            del model
 
-        if payload.options is not None and payload.options.preserveRows is not None:
-            candidates = sorted(
-                candidates,
-                key=lambda candidate: (
-                    candidate.preserve_order
-                    if candidate.preserve_order is not None
-                    else 2**31
-                ),
-            )
+        if options is not None and options.preserveRows is not None:
+            candidates = sorted(candidates, key=lambda candidate: candidate.preserve_order or 0)
         else:
-            lane_order = {lane: index for index, lane in enumerate(expected_lanes)}
+            lane_order = {track.lane: index for index, track in enumerate(timing.tracks)}
             candidates = sorted(
                 candidates,
                 key=lambda candidate: (
@@ -696,19 +720,14 @@ class DraftEngine:
                 "trackCount": 2,
                 "rowCount": len(rows),
                 "wordCount": sum(len(candidate.words) for candidate in candidates),
-                "preprocessing": preprocessing,
-                "preservedRows": (
-                    payload.options is not None
-                    and payload.options.preserveRows is not None
-                ),
+                "preprocessing": timing.summary.get("preprocessing"),
+                "preservedRows": options is not None and options.preserveRows is not None,
                 "latencyMs": {
-                    "preparation": round((preprocess_finished - started) * 1000),
-                    "gpuQueue": round((inference_started - wait_started) * 1000),
-                    "asr": round((asr_finished - inference_started) * 1000),
-                    "l2": round((inference_finished - asr_finished) * 1000),
+                    "gpuQueue": round((inference_started - started) * 1000),
+                    "l2": round((inference_finished - inference_started) * 1000),
                     "total": round((finished - started) * 1000),
                 },
-                "segmentation": diagnostics,
+                "segmentation": timing.summary.get("segmentation", {}),
             },
             models=self.model_summary(),
         )

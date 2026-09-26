@@ -8,6 +8,8 @@ Type=simple
 User=www-data
 Group=www-data
 WorkingDirectory=/opt/babel-l0-swarm
+Environment=COORDINATOR_CACHE_DIR=/var/cache/babel-l0-swarm/timing
+CacheDirectory=babel-l0-swarm
 ExecStart=/opt/babel-l0-swarm/venv/bin/uvicorn l0_draft_engine.coordinator:app --host 127.0.0.1 --port 18768 --workers 1
 Restart=on-failure
 RestartSec=3
@@ -15,7 +17,7 @@ PrivateTmp=true
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/tmp
+ReadWritePaths=/tmp /var/cache/babel-l0-swarm
 
 [Install]
 WantedBy=multi-user.target

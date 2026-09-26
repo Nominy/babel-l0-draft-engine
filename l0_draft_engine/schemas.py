@@ -151,17 +151,49 @@ class TranscriptionToken(BaseModel):
         return self
 
 
+class TimingSegment(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    id: str = Field(min_length=1)
+    startSeconds: float = Field(ge=0)
+    endSeconds: float = Field(gt=0)
+    startSample: int = Field(ge=0)
+    endSample: int = Field(gt=0)
+    sampleRate: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def positive_interval(self) -> "TimingSegment":
+        if self.endSeconds <= self.startSeconds or self.endSample <= self.startSample:
+            raise ValueError("segment duration must be positive")
+        if not math.isclose(self.startSeconds, self.startSample / self.sampleRate, abs_tol=1e-5):
+            raise ValueError("segment start sample and timestamp disagree")
+        if not math.isclose(self.endSeconds, self.endSample / self.sampleRate, abs_tol=1e-5):
+            raise ValueError("segment end sample and timestamp disagree")
+        return self
+
+
 class TranscriptionTrack(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     lane: str
     tokens: list[TranscriptionToken]
+    segments: list[TimingSegment]
+    pcmSha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sampleRate: int = Field(gt=0)
 
 
 class TranscriptionResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     taskId: str
+    accessToken: str | None = None
     tracks: list[TranscriptionTrack] = Field(min_length=2, max_length=2)
     summary: dict[str, object]
     models: dict[str, object]
+
+
+class DraftTimingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    timing: TranscriptionResponse
+    options: DraftOptions | None = None

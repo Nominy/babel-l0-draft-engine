@@ -19,6 +19,7 @@ from l0_draft_engine.schemas import (
     DraftResponse,
     DraftRow,
     TrackSpec,
+    TimingSegment,
     TranscriptionResponse,
     TranscriptionToken,
     TranscriptionTrack,
@@ -58,16 +59,15 @@ class FakeEngine(DraftEngine):
         if not hold_first_draft:
             self.release_first_draft.set()
 
-    def draft(self, payload, paths) -> DraftResponse:
+    def draft(self, timing, options=None) -> DraftResponse:
         with self._draft_state_lock:
             self.draft_calls += 1
             call_number = self.draft_calls
             self.active_drafts += 1
             self.max_active_drafts = max(self.max_active_drafts, self.active_drafts)
         try:
-            self.paths = list(paths.values())
-            assert set(paths) == {"speaker-1", "speaker-2"}
-            assert all(path.is_file() for path in paths.values())
+            assert timing.taskId == "task-1"
+            assert len(timing.tracks) == 2
             if call_number == 1:
                 self.first_draft_started.set()
                 if not self.release_first_draft.wait(timeout=5):
@@ -111,8 +111,16 @@ class FakeEngine(DraftEngine):
                                 endSeconds=0.08,
                             )
                         ],
+                        segments=[TimingSegment(
+                            id="speaker-1-segment", startSeconds=0, endSeconds=0.1,
+                            startSample=0, endSample=1600, sampleRate=16_000,
+                        )],
+                        pcmSha256="a" * 64, sampleRate=16_000,
                     ),
-                    TranscriptionTrack(lane="speaker-2", tokens=[]),
+                    TranscriptionTrack(
+                        lane="speaker-2", tokens=[], segments=[],
+                        pcmSha256="b" * 64, sampleRate=16_000,
+                    ),
                 ],
                 summary={"trackCount": 2, "tokenCount": 1},
                 models={"asr": "mock"},
@@ -128,6 +136,27 @@ def payload(tracks: int = 2) -> str:
         {"lane": "speaker-2", "fieldName": "audio:2"},
     ][:tracks]
     return json.dumps({"taskId": "task-1", "tracks": values})
+
+
+def timing_payload() -> dict[str, object]:
+    return {
+        "timing": {
+            "taskId": "task-1",
+            "tracks": [
+                {
+                    "lane": "speaker-1", "pcmSha256": "a" * 64, "sampleRate": 16_000,
+                    "tokens": [{"id": "timing-1", "text": "Привет",
+                                "startSeconds": 0.01, "endSeconds": 0.08}],
+                    "segments": [{"id": "speaker-1-segment", "startSeconds": 0,
+                                  "endSeconds": 0.1, "startSample": 0,
+                                  "endSample": 1600, "sampleRate": 16_000}],
+                },
+                {"lane": "speaker-2", "tokens": [], "segments": [],
+                 "pcmSha256": "b" * 64, "sampleRate": 16_000},
+            ],
+            "summary": {"tokenCount": 1}, "models": {"asr": "mock"},
+        }
+    }
 
 
 def test_track_lanes_accept_human_and_cyrillic_labels() -> None:
@@ -202,31 +231,7 @@ async def test_health_does_not_load_models(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_draft_accepts_declared_colon_fields_and_cleans_temp_files() -> None:
-    settings = Settings()
-    engine = FakeEngine()
-    app = create_app(settings, engine)
-    files = {
-        "audio:1": ("first.wav", wav_bytes(), "audio/wav"),
-        "audio:2": ("second.wav", wav_bytes(), "audio/wav"),
-    }
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
-    ) as client:
-        response = await client.post(
-            "/v1/draft",
-            data={"payload": payload()},
-            files=files,
-            headers=PROXY_HEADERS,
-        )
-    assert response.status_code == 200, response.text
-    assert response.json()["rows"][0]["endSeconds"] > response.json()["rows"][0]["startSeconds"]
-    assert engine.draft_calls == 1
-    assert engine.paths and all(not path.exists() for path in engine.paths)
-
-
-@pytest.mark.anyio
-async def test_transcribe_uses_draft_multipart_contract_and_cleans_temp_files() -> None:
+async def test_transcribe_uses_multipart_contract_and_cleans_temp_files() -> None:
     settings = Settings()
     engine = FakeEngine()
     app = create_app(settings, engine)
@@ -245,7 +250,7 @@ async def test_transcribe_uses_draft_multipart_contract_and_cleans_temp_files() 
 
     assert response.status_code == 200, response.text
     body = response.json()
-    assert set(body) == {"taskId", "tracks", "summary", "models"}
+    assert set(body) == {"taskId", "accessToken", "tracks", "summary", "models"}
     assert body["taskId"] == "task-1"
     assert [track["lane"] for track in body["tracks"]] == [
         "speaker-1",
@@ -265,7 +270,7 @@ async def test_transcribe_uses_draft_multipart_contract_and_cleans_temp_files() 
 
 
 @pytest.mark.anyio
-async def test_draft_rejects_any_count_other_than_two_tracks() -> None:
+async def test_transcribe_rejects_any_count_other_than_two_tracks() -> None:
     settings = Settings()
     engine = FakeEngine()
     app = create_app(settings, engine)
@@ -273,13 +278,13 @@ async def test_draft_rejects_any_count_other_than_two_tracks() -> None:
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
         response = await client.post(
-            "/v1/draft",
+            "/v1/transcribe",
             data={"payload": payload(1)},
             files={"audio:1": ("only.wav", wav_bytes(), "audio/wav")},
             headers=PROXY_HEADERS,
         )
     assert response.status_code == 422
-    assert engine.draft_calls == 0
+    assert engine.transcribe_calls == 0
 
 
 @pytest.mark.anyio
@@ -305,7 +310,7 @@ async def test_invalid_payload_returns_a_json_serializable_422() -> None:
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
         response = await client.post(
-            "/v1/draft",
+            "/v1/transcribe",
             data={"payload": invalid_payload},
             files=files,
             headers=PROXY_HEADERS,
@@ -316,11 +321,11 @@ async def test_invalid_payload_returns_a_json_serializable_422() -> None:
     assert detail[0]["loc"] == ["tracks", 0, "lane"]
     assert "ctx" not in detail[0]
     json.dumps(detail)
-    assert engine.draft_calls == 0
+    assert engine.transcribe_calls == 0
 
 
 @pytest.mark.anyio
-async def test_draft_rejects_stereo_track_before_inference() -> None:
+async def test_transcribe_rejects_stereo_track_before_inference() -> None:
     settings = Settings()
     engine = FakeEngine()
     app = create_app(settings, engine)
@@ -332,14 +337,14 @@ async def test_draft_rejects_stereo_track_before_inference() -> None:
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
         response = await client.post(
-            "/v1/draft",
+            "/v1/transcribe",
             data={"payload": payload()},
             files=files,
             headers=PROXY_HEADERS,
         )
     assert response.status_code == 422
     assert "mono" in response.json()["detail"]
-    assert engine.draft_calls == 0
+    assert engine.transcribe_calls == 0
 
 
 @pytest.mark.anyio
@@ -351,7 +356,7 @@ async def test_request_content_length_limit_is_enforced_before_form_parsing() ->
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
         response = await client.post(
-            "/v1/draft",
+            "/v1/transcribe",
             content=b"ignored",
             headers={
                 **PROXY_HEADERS,
@@ -359,7 +364,7 @@ async def test_request_content_length_limit_is_enforced_before_form_parsing() ->
             },
         )
     assert response.status_code == 413
-    assert engine.draft_calls == 0
+    assert engine.transcribe_calls == 0
 
 @pytest.mark.anyio
 async def test_chunked_request_body_limit_cannot_be_bypassed() -> None:
@@ -376,7 +381,7 @@ async def test_chunked_request_body_limit_cannot_be_bypassed() -> None:
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
         response = await client.post(
-            "/v1/draft",
+            "/v1/transcribe",
             content=oversized_body(),
             headers={
                 **PROXY_HEADERS,
@@ -384,7 +389,7 @@ async def test_chunked_request_body_limit_cannot_be_bypassed() -> None:
             },
         )
     assert response.status_code == 413
-    assert engine.draft_calls == 0
+    assert engine.transcribe_calls == 0
 
 
 @pytest.mark.anyio
@@ -395,7 +400,7 @@ async def test_draft_requires_proxy_header() -> None:
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
-        forbidden = await client.post("/v1/draft", content=b"")
+        forbidden = await client.post("/v1/draft", json=timing_payload())
     assert forbidden.status_code == 403
     assert engine.draft_calls == 0
 
@@ -408,13 +413,7 @@ async def test_concurrent_draft_requests_wait_and_execute_one_at_a_time() -> Non
 
     async def post_draft(client: httpx.AsyncClient) -> httpx.Response:
         return await client.post(
-            "/v1/draft",
-            data={"payload": payload()},
-            files={
-                "audio:1": ("first.wav", wav_bytes(), "audio/wav"),
-                "audio:2": ("second.wav", wav_bytes(), "audio/wav"),
-            },
-            headers=PROXY_HEADERS,
+            "/v1/draft", json=timing_payload(), headers=PROXY_HEADERS,
         )
 
     async with httpx.AsyncClient(
@@ -439,7 +438,7 @@ async def test_concurrent_draft_requests_wait_and_execute_one_at_a_time() -> Non
 
 
 @pytest.mark.anyio
-async def test_admission_rejects_a_fourth_request_before_body_parsing() -> None:
+async def test_draft_admission_rejects_a_fourth_concurrent_request() -> None:
     settings = Settings(max_inflight_requests=3)
     engine = FakeEngine(hold_first_draft=True)
     app = create_app(settings, engine)
@@ -449,11 +448,7 @@ async def test_admission_rejects_a_fourth_request_before_body_parsing() -> None:
     ) -> httpx.Response:
         return await client.post(
             "/v1/draft",
-            data={"payload": payload()},
-            files={
-                "audio:1": ("first.wav", wav_bytes(), "audio/wav"),
-                "audio:2": ("second.wav", wav_bytes(), "audio/wav"),
-            },
+            json=timing_payload(),
             headers={**PROXY_HEADERS, "X-Babel-Request-Id": request_id},
         )
 
@@ -465,13 +460,6 @@ async def test_admission_rejects_a_fourth_request_before_body_parsing() -> None:
                 return
             await asyncio.sleep(0.01)
         raise AssertionError(f"queue status never appeared for {request_id}")
-
-    body_was_read = False
-
-    async def rejected_body():
-        nonlocal body_was_read
-        body_was_read = True
-        yield b"this body must not be parsed"
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
@@ -485,10 +473,9 @@ async def test_admission_rejects_a_fourth_request_before_body_parsing() -> None:
         try:
             rejected = await client.post(
                 "/v1/draft",
-                content=rejected_body(),
+                json=timing_payload(),
                 headers={
                     **PROXY_HEADERS,
-                    "Content-Type": "multipart/form-data; boundary=unused",
                     "X-Babel-Request-Id": "rejected-fourth",
                     "Origin": "https://dashboard.babel.audio",
                 },
@@ -497,7 +484,6 @@ async def test_admission_rejects_a_fourth_request_before_body_parsing() -> None:
             assert rejected.headers["retry-after"] == "5"
             assert rejected.headers["access-control-expose-headers"] == "Retry-After"
             assert rejected.json()["detail"] == "too many in-flight requests"
-            assert body_was_read is False
             assert engine.draft_calls == 1
             assert (
                 await client.get("/v1/queue/rejected-fourth")
@@ -520,24 +506,18 @@ async def test_admission_slot_recovers_after_invalid_and_completed_requests() ->
     app = create_app(settings, engine)
 
     async def post_draft(
-        client: httpx.AsyncClient, request_payload: str
+        client: httpx.AsyncClient, request_payload: dict[str, object]
     ) -> httpx.Response:
         return await client.post(
-            "/v1/draft",
-            data={"payload": request_payload},
-            files={
-                "audio:1": ("first.wav", wav_bytes(), "audio/wav"),
-                "audio:2": ("second.wav", wav_bytes(), "audio/wav"),
-            },
-            headers=PROXY_HEADERS,
+            "/v1/draft", json=request_payload, headers=PROXY_HEADERS,
         )
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
-        invalid = await post_draft(client, "{")
-        after_invalid = await post_draft(client, payload())
-        after_completion = await post_draft(client, payload())
+        invalid = await post_draft(client, {"timing": {"taskId": "task-1"}})
+        after_invalid = await post_draft(client, timing_payload())
+        after_completion = await post_draft(client, timing_payload())
 
     assert invalid.status_code == 422
     assert after_invalid.status_code == 200, after_invalid.text
@@ -554,11 +534,7 @@ async def test_queue_status_reports_running_position_and_completion() -> None:
     async def post_draft(client: httpx.AsyncClient, request_id: str) -> httpx.Response:
         return await client.post(
             "/v1/draft",
-            data={"payload": payload()},
-            files={
-                "audio:1": ("first.wav", wav_bytes(), "audio/wav"),
-                "audio:2": ("second.wav", wav_bytes(), "audio/wav"),
-            },
+            json=timing_payload(),
             headers={**PROXY_HEADERS, "X-Babel-Request-Id": request_id},
         )
 
@@ -612,6 +588,8 @@ async def test_draft_and_transcribe_share_one_inference_queue() -> None:
     app = create_app(settings, engine)
 
     async def post(client: httpx.AsyncClient, endpoint: str) -> httpx.Response:
+        if endpoint == "/v1/draft":
+            return await client.post(endpoint, json=timing_payload(), headers=PROXY_HEADERS)
         return await client.post(
             endpoint,
             data={"payload": payload()},
@@ -719,7 +697,7 @@ async def test_accepted_upload_keeps_models_resident_until_request_finishes() ->
     ) as client:
         request = asyncio.create_task(
             client.post(
-                "/v1/draft",
+                "/v1/transcribe",
                 content=uploading_body(),
                 headers={
                     **PROXY_HEADERS,
@@ -749,13 +727,13 @@ async def test_cancellation_holds_models_until_last_worker_finishes(
     release_second = threading.Event()
 
     class QueuedEngine(FakeEngine):
-        def draft(self, payload, paths):
+        def draft(self, timing, options=None):
             if self.draft_calls == 1:
                 second_started.set()
                 if not release_second.wait(timeout=5):
                     raise TimeoutError("test did not release the second draft")
             assert self.model_summary()["asr"]["loaded"] is True
-            return super().draft(payload, paths)
+            return super().draft(timing, options)
 
     engine = QueuedEngine(hold_first_draft=True)
     with engine.model_session():
@@ -775,11 +753,7 @@ async def test_cancellation_holds_models_until_last_worker_finishes(
     async def post_draft(client, request_id):
         return await client.post(
             "/v1/draft",
-            data={"payload": payload()},
-            files={
-                "audio:1": ("first.wav", wav_bytes(), "audio/wav"),
-                "audio:2": ("second.wav", wav_bytes(), "audio/wav"),
-            },
+            json=timing_payload(),
             headers={**PROXY_HEADERS, "X-Babel-Request-Id": request_id},
         )
 

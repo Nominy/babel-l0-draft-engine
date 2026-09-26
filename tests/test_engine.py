@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import builtins
+import hashlib
+import io
+import json
 import sys
 import tempfile
 import threading
@@ -13,9 +17,12 @@ from types import SimpleNamespace
 import wave
 from unittest.mock import patch
 
+import httpx
 import pytest
 
+from l0_draft_engine.app import create_app as create_backend_app
 from l0_draft_engine.config import Settings
+from l0_draft_engine.coordinator import CoordinatorSettings, create_app as create_coordinator_app
 from l0_draft_engine.engine import DraftEngine
 from l0_draft_engine.gigaam_asr import GigaWord
 from l0_draft_engine.schemas import DraftPayload
@@ -154,7 +161,7 @@ def fake_prepare(lane: str, source: Path, derived_dir: Path, mode: str):
         sample_rate=16_000,
         frame_count=frame_count,
         source_sha256=f"source-{lane}",
-        pcm_sha256=f"pcm-{lane}",
+        pcm_sha256=hashlib.sha256(pcm).hexdigest(),
     )
     return track, pcm
 
@@ -192,8 +199,9 @@ def test_s2_segment_asr_preserves_gigaam_surfaces_and_stable_rows() -> None:
         "l0_draft_engine.engine.prepare_track", side_effect=fake_prepare
     ), patch("l0_draft_engine.engine.segment_track", side_effect=fake_segment):
         paths = audio_paths(Path(temporary))
-        first = engine.draft(draft_payload(), paths)
-        second = engine.draft(draft_payload(), paths)
+        timing = engine.transcribe(draft_payload(), paths)
+        first = engine.draft(timing)
+        second = engine.draft(timing)
 
     assert [row.id for row in first.rows] == [row.id for row in second.rows]
     assert all(uuid.UUID(row.id).version == 5 for row in first.rows)
@@ -202,7 +210,7 @@ def test_s2_segment_asr_preserves_gigaam_surfaces_and_stable_rows() -> None:
     assert next(row.text for row in first.rows if row.lane == "speaker-1") == "Угу."
     assert first.summary["rowCount"] == 2
     assert first.models["asr"]["name"] == "v3_ctc"
-    assert len(asr.calls) == 4
+    assert len(asr.calls) == 2
 
 
 def test_silent_lane_is_omitted_from_replacement_rows() -> None:
@@ -224,7 +232,8 @@ def test_silent_lane_is_omitted_from_replacement_rows() -> None:
     ), patch(
         "l0_draft_engine.engine.segment_track", side_effect=segment_only_speaker
     ):
-        response = engine.draft(draft_payload(), audio_paths(Path(temporary)))
+        timing = engine.transcribe(draft_payload(), audio_paths(Path(temporary)))
+        response = engine.draft(timing)
 
     assert [row.lane for row in response.rows] == ["speaker-1"]
     assert response.summary["rowCount"] == 1
@@ -258,10 +267,10 @@ def test_s2_range_is_the_model_input_and_one_babel_row() -> None:
         "l0_draft_engine.engine.segment_track", side_effect=segmented_window
     ):
         paths = audio_paths(Path(temporary))
-        response = engine.draft(draft_payload(), paths)
         transcription = engine.transcribe(draft_payload(), paths)
+        response = engine.draft(transcription)
 
-    assert asr.input_durations == [2.0, 2.0, 2.0, 2.0]
+    assert asr.input_durations == [2.0, 2.0]
     assert [(row.startSeconds, row.endSeconds) for row in response.rows] == [
         (1.0, 3.0),
         (1.0, 3.0),
@@ -301,7 +310,7 @@ def test_raw_asr_mode_still_segments_from_afftdn_pcm() -> None:
     ), patch(
         "l0_draft_engine.engine.segment_track", side_effect=record_segment
     ):
-        engine.draft(draft_payload(), audio_paths(Path(temporary)))
+        engine.transcribe(draft_payload(), audio_paths(Path(temporary)))
 
     assert len(observed_segmentation_pcm) == 2
     assert all(audio.startswith(b"\x11\x00") for audio in observed_segmentation_pcm)
@@ -355,7 +364,8 @@ def test_preserve_rows_keeps_live_boundaries_ids_and_empty_interval_fallback() -
     with tempfile.TemporaryDirectory() as temporary, patch(
         "l0_draft_engine.engine.prepare_track", side_effect=fake_prepare
     ), patch("l0_draft_engine.engine.segment_track", side_effect=fake_segment):
-        response = engine.draft(payload, audio_paths(Path(temporary)))
+        timing = engine.transcribe(payload, audio_paths(Path(temporary)))
+        response = engine.draft(timing, payload.options)
 
     assert [row.id for row in response.rows] == ["live-b", "live-a", "live-c"]
     assert [(row.startSeconds, row.endSeconds) for row in response.rows] == [
@@ -435,10 +445,11 @@ def test_gpu_inference_is_serialized_across_requests() -> None:
         paths = audio_paths(Path(temporary))
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = [
-                pool.submit(engine.draft, draft_payload(f"task-{index}"), paths)
+                pool.submit(engine.transcribe, draft_payload(f"task-{index}"), paths)
                 for index in range(2)
             ]
-            responses = [future.result() for future in futures]
+            timings = [future.result() for future in futures]
+            responses = [engine.draft(timing) for timing in timings]
     assert all(len(response.rows) == 2 for response in responses)
     assert asr.max_active == 1
 
@@ -535,10 +546,9 @@ def test_gpu_inference_is_serialized_across_draft_and_transcribe() -> None:
         second_directory = root / "transcribe"
         first_directory.mkdir()
         second_directory.mkdir()
+        timing = engine.transcribe(draft_payload("draft-task"), audio_paths(first_directory))
         with ThreadPoolExecutor(max_workers=2) as pool:
-            draft_future = pool.submit(
-                engine.draft, draft_payload("draft-task"), audio_paths(first_directory)
-            )
+            draft_future = pool.submit(engine.draft, timing)
             transcribe_future = pool.submit(
                 engine.transcribe,
                 draft_payload("transcribe-task"),
@@ -557,7 +567,10 @@ def test_idle_expiry_frees_models_and_next_inference_reloads(
     lifecycle_engine, idle_timers, tmp_path: Path, operation: str
 ) -> None:
     engine, references = lifecycle_engine
-    infer = getattr(engine, operation)
+    infer = (
+        lambda payload, paths: engine.draft(engine.transcribe(payload, paths))
+        if operation == "draft" else engine.transcribe(payload, paths)
+    )
     first = infer(draft_payload(), audio_paths(tmp_path))
     if operation == "draft":
         assert [row.text for row in first.rows] == ["Угу.", "Привет."]
@@ -587,7 +600,7 @@ def test_nested_sessions_and_stale_callbacks_cannot_evict_refreshed_models(
     lifecycle_engine, idle_timers, tmp_path: Path
 ) -> None:
     engine, references = lifecycle_engine
-    engine.draft(draft_payload(), audio_paths(tmp_path))
+    engine.draft(engine.transcribe(draft_payload(), audio_paths(tmp_path)))
     stale_timer = idle_timers[-1]
 
     with engine.model_session():
@@ -610,7 +623,7 @@ def test_waiting_session_keeps_models_after_running_session_finishes(
     lifecycle_engine, idle_timers, tmp_path: Path
 ) -> None:
     engine, references = lifecycle_engine
-    engine.draft(draft_payload(), audio_paths(tmp_path))
+    engine.draft(engine.transcribe(draft_payload(), audio_paths(tmp_path)))
     stale_timer = idle_timers[-1]
     waiting = threading.Event()
     release = threading.Event()
@@ -642,7 +655,7 @@ def test_close_defers_release_until_last_session_and_forbids_new_work(
     lifecycle_engine, idle_timers, tmp_path: Path
 ) -> None:
     engine, references = lifecycle_engine
-    engine.draft(draft_payload(), audio_paths(tmp_path))
+    engine.draft(engine.transcribe(draft_payload(), audio_paths(tmp_path)))
     stale_timer = idle_timers[-1]
 
     with engine.model_session():
@@ -674,7 +687,7 @@ def test_close_releases_idle_models_even_when_automatic_eviction_is_disabled(
         asr_factory=FakeASR,
         formatter_factory=FakeFormatter,
     )
-    engine.draft(draft_payload(), audio_paths(tmp_path))
+    engine.draft(engine.transcribe(draft_payload(), audio_paths(tmp_path)))
     asr = weakref.ref(engine._asr)
     formatter = weakref.ref(engine._formatter)
     if idle_seconds == 0:
@@ -715,7 +728,7 @@ def test_idle_eviction_releases_models_before_clearing_selected_allocator(
             ),
         ),
     )
-    engine.draft(draft_payload(), audio_paths(tmp_path))
+    engine.draft(engine.transcribe(draft_payload(), audio_paths(tmp_path)))
     idle_timers[-1].fire()
     assert cleared == [device]
 
@@ -724,7 +737,7 @@ def test_evicting_fake_models_does_not_import_torch(
     lifecycle_engine, idle_timers, monkeypatch, tmp_path: Path
 ) -> None:
     engine, references = lifecycle_engine
-    engine.draft(draft_payload(), audio_paths(tmp_path))
+    engine.draft(engine.transcribe(draft_payload(), audio_paths(tmp_path)))
     monkeypatch.delitem(sys.modules, "torch", raising=False)
     original_import = builtins.__import__
     torch_imports = []
@@ -740,3 +753,80 @@ def test_evicting_fake_models_does_not_import_torch(
 
     assert all(reference() is None for reference in references)
     assert torch_imports == []
+
+
+@pytest.mark.anyio
+async def test_coordinator_trusted_timing_then_punctuation_never_repeats_asr(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr("l0_draft_engine.engine.prepare_track", fake_prepare)
+    monkeypatch.setattr("l0_draft_engine.engine.segment_track", fake_segment)
+    asr = FakeASR(delay=0.01)
+    engine = DraftEngine(
+        Settings(device="cpu", preprocessing="raw"),
+        asr_factory=lambda: asr, formatter_factory=FakeFormatter,
+    )
+    backend = create_backend_app(engine=engine)
+    upstream = httpx.AsyncClient(transport=httpx.ASGITransport(app=backend), base_url="http://trusted")
+    coordinator = create_coordinator_app(
+        CoordinatorSettings(
+            backend_urls=("http://trusted",), max_track_bytes=4096,
+            max_request_bytes=12_000, cache_dir=tmp_path / "cache",
+        ), client=upstream,
+    )
+    audio = io.BytesIO()
+    with wave.open(audio, "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16_000)
+        output.writeframes(b"\x00\x00" * 1600)
+    task_id = "test/path-with-slashes"
+    bearer = {"Authorization": f"Bearer {'x' * 43}"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=coordinator), base_url="http://coordinator"
+    ) as client:
+        timing = await client.post(
+            "/v1/transcribe",
+            data={"payload": json.dumps(draft_payload(task_id).model_dump())},
+            files={
+                "audio:1": ("first.wav", audio.getvalue(), "audio/wav"),
+                "audio:2": ("second.wav", audio.getvalue(), "audio/wav"),
+            },
+            headers={**bearer, "X-Babel-Local-Engine": "1"},
+        )
+        assert timing.status_code == 200, timing.text
+        assert len(asr.calls) == 2
+        assert [track["segments"][0]["startSample"] for track in timing.json()["tracks"]] == [0, 0]
+        assert (await client.post("/v1/timing/lookup", json={"taskId": task_id},
+                                  headers=bearer)).json() == timing.json()
+        punctuation = await client.post(
+            "/v1/draft", json={"taskId": task_id}, headers=bearer,
+        )
+        assert punctuation.status_code == 200, punctuation.text
+        assert [row["text"] for row in punctuation.json()["rows"]] == ["Угу.", "Привет."]
+        assert all(row["endSeconds"] > row["startSeconds"] for row in punctuation.json()["rows"])
+        assert len(asr.calls) == 2
+        repeat = await client.post(
+            "/v1/draft", json={"taskId": task_id}, headers=bearer,
+        )
+        assert repeat.status_code == 200
+        assert [row["id"] for row in repeat.json()["rows"]] == [
+            row["id"] for row in punctuation.json()["rows"]
+        ]
+        preserved = {
+            "taskId": task_id,
+            "options": {"preserveRows": [{
+                "rowId": "existing-row", "speakerKey": "speaker-1",
+                "startSeconds": 0.0, "endSeconds": 1.0,
+                "text": "старое", "index": 0,
+            }]},
+        }
+        changed = await client.post("/v1/draft", json=preserved, headers=bearer)
+        assert changed.status_code == 200, changed.text
+        assert [(row["id"], row["text"]) for row in changed.json()["rows"]] == [
+            ("existing-row", "Угу.")
+        ]
+        preserved["options"]["preserveRows"][0]["speakerKey"] = "another-lane"
+        assert (await client.post("/v1/draft", json=preserved, headers=bearer)).status_code == 422
+        assert len(asr.calls) == 2
+    await upstream.aclose()

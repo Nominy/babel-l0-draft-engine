@@ -11,6 +11,7 @@ import asyncio
 from contextlib import ExitStack, asynccontextmanager
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+import hashlib
 import json
 import math
 import os
@@ -27,12 +28,12 @@ import wave
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from starlette.datastructures import UploadFile
 from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .schemas import DraftPayload, DraftResponse, TranscriptionResponse
+from .schemas import DraftOptions, DraftPayload, DraftResponse, TranscriptionResponse
 
 
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
@@ -42,6 +43,7 @@ ALLOWED_ORIGIN_RE = (
 )
 CHUNK_BYTES = 1024 * 1024
 WORKER_BODY_BYTES = 16 * 1024 * 1024
+ACCESS_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
 
 
 def _positive_env(name: str, default: int) -> int:
@@ -67,6 +69,8 @@ class CoordinatorSettings:
     worker_idle_seconds: float = 45.0
     backend_timeout_seconds: float = 900.0
     request_timeout_seconds: float = 895.0  # below the public Apache 900-second timeout
+    cache_dir: Path = field(default_factory=lambda: Path.home() / ".cache" / "babel" / "timing")
+    cache_max_bytes: int = 4 * 1024**3
 
     def __post_init__(self) -> None:
         if not self.backend_urls or any(
@@ -84,6 +88,8 @@ class CoordinatorSettings:
             raise ValueError("coordinator timeouts must be positive")
         if self.queue_seconds + self.lease_seconds >= self.request_timeout_seconds:
             raise ValueError("volunteer wait must leave time for trusted fallback")
+        if not 0 < self.cache_max_bytes <= 4 * 1024**3:
+            raise ValueError("cache_max_bytes must be between 1 byte and 4 GiB")
 
     @classmethod
     def from_env(cls) -> CoordinatorSettings:
@@ -101,6 +107,8 @@ class CoordinatorSettings:
             worker_idle_seconds=_positive_env("COORDINATOR_WORKER_IDLE_SECONDS", int(defaults.worker_idle_seconds)),
             backend_timeout_seconds=_positive_env("COORDINATOR_BACKEND_TIMEOUT_SECONDS", int(defaults.backend_timeout_seconds)),
             request_timeout_seconds=_positive_env("COORDINATOR_REQUEST_SECONDS", int(defaults.request_timeout_seconds)),
+            cache_dir=Path(os.environ.get("COORDINATOR_CACHE_DIR", defaults.cache_dir)),
+            cache_max_bytes=_positive_env("COORDINATOR_CACHE_MAX_BYTES", defaults.cache_max_bytes),
         )
 
 
@@ -167,6 +175,16 @@ def _check_length(request: Request, maximum: int) -> None:
         raise HTTPException(413, "request exceeds size limit")
 
 
+def _access_token(request: Request, *, required: bool = True) -> str | None:
+    authorization = request.headers.get("authorization", "")
+    token = authorization[7:] if authorization.startswith("Bearer ") else ""
+    if not ACCESS_TOKEN_RE.fullmatch(token):
+        if not required:
+            return None
+        raise HTTPException(401, "timing bearer token is required")
+    return token
+
+
 def _parse_form(form: object) -> tuple[DraftPayload, str, dict[str, UploadFile]]:
     raw_payloads: list[str] = []
     files: dict[str, UploadFile] = {}
@@ -191,13 +209,15 @@ def _parse_form(form: object) -> tuple[DraftPayload, str, dict[str, UploadFile]]
     return payload, raw_payloads[0], files
 
 
-async def _copy_audio(upload: UploadFile, path: Path, limit: int, max_seconds: float) -> None:
+async def _copy_audio(upload: UploadFile, path: Path, limit: int, max_seconds: float) -> str:
     size = 0
+    digest = hashlib.sha256()
     with path.open("xb") as output:
         while chunk := await upload.read(CHUNK_BYTES):
             size += len(chunk)
             if size > limit:
                 raise HTTPException(413, "audio track exceeds size limit")
+            digest.update(chunk)
             output.write(chunk)
     if not size:
         raise HTTPException(422, "audio track is empty")
@@ -215,11 +235,24 @@ async def _copy_audio(upload: UploadFile, path: Path, limit: int, max_seconds: f
         raise
     except (EOFError, OSError, wave.Error) as exc:
         raise HTTPException(422, "each audio track must be a valid WAV file") from exc
+    return digest.hexdigest()
+
+
+class TaskBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    taskId: str = Field(min_length=1, max_length=256)
+    options: DraftOptions | None = None
+
+    @field_validator("taskId")
+    @classmethod
+    def valid_task_id(cls, value: str) -> str:
+        return DraftPayload.valid_task_id(value)
 
 
 class RegisterBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     modelBundleSchema: Literal["babel-browser-model-bundle-v2"]
+    protocolVersion: Literal[2]
 
 
 class WorkerBody(BaseModel):
@@ -241,6 +274,97 @@ class CompleteBody(WorkerBody):
 
 
 @dataclass
+class TimingFlight:
+    token_digest: str
+    audio_digests: tuple[str, ...]
+    result: asyncio.Future[TranscriptionResponse | None]
+
+
+class TimingCache:
+    """Private, on-disk LRU of completed timing results keyed by task identity."""
+
+    def __init__(self, directory: Path, max_bytes: int) -> None:
+        self.directory = directory
+        self.max_bytes = max_bytes
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._rotate()
+
+    def _path(self, task_id: str) -> Path:
+        return self.directory / f"{hashlib.sha256(task_id.encode()).hexdigest()}.json"
+
+    def get(self, task_id: str, token: str, audio_digests: tuple[str, ...] | None = None) -> TranscriptionResponse | None:
+        path = self._path(task_id)
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            path.unlink(missing_ok=True)
+            return None
+        try:
+            timing = TranscriptionResponse.model_validate(record["timing"])
+            if (
+                record["taskId"] != task_id or timing.taskId != task_id
+                or not isinstance(record["tokenDigest"], str)
+                or not isinstance(record["audioDigests"], list)
+            ):
+                raise ValueError("invalid timing cache record")
+        except (ValueError, KeyError, TypeError, ValidationError):
+            path.unlink(missing_ok=True)
+            return None
+        if not secrets.compare_digest(
+            record["tokenDigest"], hashlib.sha256(token.encode()).hexdigest()
+        ):
+            return None
+        if audio_digests is not None and record["audioDigests"] != list(audio_digests):
+            return None
+        try:
+            os.utime(path)
+        except FileNotFoundError:
+            return None
+        return timing.model_copy(update={"accessToken": token})
+
+    def put(self, timing: TranscriptionResponse, token: str, audio_digests: tuple[str, ...]) -> None:
+        data = json.dumps({
+            "taskId": timing.taskId,
+            "tokenDigest": hashlib.sha256(token.encode()).hexdigest(),
+            "audioDigests": audio_digests,
+            "timing": timing.model_dump(exclude={"accessToken"}),
+        }, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        if len(data) > self.max_bytes:
+            raise ValueError("timing response exceeds cache limit")
+        with tempfile.NamedTemporaryFile(dir=self.directory, prefix=".timing-", delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            try:
+                temporary.write(data)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            except BaseException:
+                temporary_path.unlink(missing_ok=True)
+                raise
+        try:
+            os.replace(temporary_path, self._path(timing.taskId))
+            self._rotate()
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+    def exists(self, task_id: str) -> bool:
+        return self._path(task_id).exists()
+
+    def _rotate(self) -> None:
+        entries = sorted(
+            ((path, path.stat()) for path in self.directory.glob("*.json") if path.is_file()),
+            key=lambda entry: entry[1].st_mtime_ns,
+        )
+        total = sum(stat.st_size for _, stat in entries)
+        for path, stat in entries:
+            if total <= self.max_bytes:
+                break
+            path.unlink(missing_ok=True)
+            total -= stat.st_size
+
+
+@dataclass
 class Worker:
     token: str
     last_seen: float
@@ -257,6 +381,8 @@ class Job:
     filenames: dict[str, str]
     types: dict[str, str]
     result: asyncio.Future[DraftResponse | TranscriptionResponse | None]
+    timing: TranscriptionResponse | None = None
+    options: DraftOptions | None = None
     leased: asyncio.Event = field(default_factory=asyncio.Event)
     job_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     worker_id: str | None = None
@@ -270,6 +396,8 @@ class Coordinator:
     def __init__(self, settings: CoordinatorSettings, client: httpx.AsyncClient) -> None:
         self.settings = settings
         self.client = client
+        self.cache = TimingCache(settings.cache_dir, settings.cache_max_bytes)
+        self.timing_flights: dict[str, TimingFlight] = {}
         self.workers: dict[str, Worker] = {}
         self.jobs: dict[str, Job] = {}
         self.by_request_id: dict[str, Job] = {}
@@ -371,6 +499,14 @@ def _validated_result(job: Job, value: dict[str, object]) -> DraftResponse | Tra
         track.lane for track in job.payload.tracks
     ]:
         raise ValueError("transcription taskId and track lanes must match the request")
+    if any(
+        track.sampleRate != segment.sampleRate
+        for track in result.tracks for segment in track.segments
+    ):
+        raise ValueError("segment sample rate must match its track")
+    segment_ids = [segment.id for track in result.tracks for segment in track.segments]
+    if len(segment_ids) != len(set(segment_ids)):
+        raise ValueError("segment IDs must be unique")
     return result
 
 
@@ -382,27 +518,42 @@ async def _backend_request(coordinator: Coordinator, job: Job, deadline: float) 
             break
         timeout = min(coordinator.settings.backend_timeout_seconds, remaining)
         job.backend_url = base
-        # ExitStack keeps both input streams open until httpx finishes streaming them.
         try:
-            with ExitStack() as streams:
-                files = {
-                    track.fieldName: (
-                        job.filenames[track.fieldName],
-                        streams.enter_context(job.paths[track.fieldName].open("rb")),
-                        job.types[track.fieldName],
-                    )
-                    for track in job.payload.tracks
-                }
+            if job.operation == "draft":
+                if job.timing is None:
+                    raise RuntimeError("draft job is missing timing")
                 upstream = await asyncio.wait_for(
                     coordinator.client.post(
-                        f"{base}/v1/{job.operation}",
-                        data={"payload": job.raw_payload},
-                        files=files,
+                        f"{base}/v1/draft",
+                        json={
+                            "timing": job.timing.model_dump(exclude={"accessToken"}),
+                            **({"options": job.options.model_dump(exclude_none=True)} if job.options else {}),
+                        },
                         headers={"X-Babel-Local-Engine": "1", "X-Babel-Request-Id": job.request_id},
                         timeout=httpx.Timeout(timeout, connect=min(5.0, timeout)),
                     ),
                     timeout=remaining,
                 )
+            else:
+                with ExitStack() as streams:
+                    files = {
+                        track.fieldName: (
+                            job.filenames[track.fieldName],
+                            streams.enter_context(job.paths[track.fieldName].open("rb")),
+                            job.types[track.fieldName],
+                        )
+                        for track in job.payload.tracks
+                    }
+                    upstream = await asyncio.wait_for(
+                        coordinator.client.post(
+                            f"{base}/v1/transcribe",
+                            data={"payload": job.raw_payload},
+                            files=files,
+                            headers={"X-Babel-Local-Engine": "1", "X-Babel-Request-Id": job.request_id},
+                            timeout=httpx.Timeout(timeout, connect=min(5.0, timeout)),
+                        ),
+                        timeout=remaining,
+                    )
         except (httpx.TransportError, asyncio.TimeoutError):
             continue
         if upstream.status_code in (502, 503, 504):
@@ -519,12 +670,18 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
             return {
                 "jobId": job.job_id, "leaseToken": job.lease_token,
                 "operation": job.operation,
-                "payload": job.payload.model_dump(exclude_none=True),
+                "payload": (
+                    {"taskId": job.payload.taskId,
+                     "timing": job.timing.model_dump(exclude={"accessToken"}),
+                     **({"options": job.options.model_dump(exclude_none=True)} if job.options else {})}
+                    if job.operation == "draft" and job.timing is not None
+                    else job.payload.model_dump(exclude_none=True)
+                ),
                 "audio": [
                     {"fieldName": track.fieldName,
                      "url": f"/v1/jobs/{job.job_id}/audio/{quote(track.fieldName, safe='')}"}
                     for track in job.payload.tracks
-                ],
+                ] if job.operation == "transcribe" else [],
             }
         return Response(status_code=204)
 
@@ -569,9 +726,112 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
             job.result.set_result(result)
         return {"ok": True}
 
-    async def infer(request: Request, operation: Literal["draft", "transcribe"]) -> Response | DraftResponse | TranscriptionResponse:
+    async def run_job(job: Job, deadline: float) -> Response | DraftResponse | TranscriptionResponse:
+        state.enqueue(job)
+        responded = False
+        try:
+            if job.phase == "queued":
+                try:
+                    await asyncio.wait_for(job.leased.wait(), timeout=min(
+                        resolved.queue_seconds, max(0, deadline - time.monotonic())
+                    ))
+                    remaining = min(
+                        max(0, (job.lease_deadline or 0) - time.monotonic()),
+                        max(0, deadline - time.monotonic()),
+                    )
+                    result = await asyncio.wait_for(asyncio.shield(job.result), timeout=remaining)
+                except asyncio.TimeoutError:
+                    result = None
+                if result is not None:
+                    responded = True
+                    return result
+            state.release(job)
+            try:
+                state.waiting.remove(job.job_id)
+            except ValueError:
+                pass
+            job.phase = "running"
+            response = await _backend_request(state, job, deadline)
+            if response.status_code != 200:
+                responded = True
+                return response
+            try:
+                result = _validated_result(job, json.loads(response.body))
+            except (ValueError, ValidationError, TypeError) as exc:
+                raise HTTPException(502, "trusted inference result is invalid") from exc
+            responded = True
+            return result
+        finally:
+            state.finish(job, completed=responded)
+
+    async def cached_timing(
+        task_id: str, token: str, *, deadline: float | None = None
+    ) -> TranscriptionResponse | None:
+        cached = state.cache.get(task_id, token)
+        if cached is not None:
+            return cached
+        flight = state.timing_flights.get(task_id)
+        if flight is None or not secrets.compare_digest(
+            flight.token_digest, hashlib.sha256(token.encode()).hexdigest()
+        ):
+            return None
+        remaining = (
+            resolved.request_timeout_seconds if deadline is None
+            else max(0, deadline - time.monotonic())
+        )
+        try:
+            result = await asyncio.wait_for(asyncio.shield(flight.result), timeout=remaining)
+            return result.model_copy(update={"accessToken": token}) if result else None
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(503, "timing request timed out") from exc
+
+    @service.post("/v1/timing/lookup", response_model=TranscriptionResponse)
+    async def lookup(request: Request, body: TaskBody) -> TranscriptionResponse:
+        token = _access_token(request, required=False)
+        timing = await cached_timing(body.taskId, token) if token else None
+        if timing is None:
+            raise HTTPException(404, "timing not found")
+        return timing
+
+    @service.post("/v1/draft", response_model=DraftResponse)
+    async def draft(request: Request, body: TaskBody) -> Response | DraftResponse:
+        token = _access_token(request, required=False)
+        if token is None:
+            raise HTTPException(404, "timing not found")
+        request_id = _request_id(request)
+        if state.inflight >= resolved.max_inflight_requests:
+            raise HTTPException(429, "too many in-flight requests", headers={"Retry-After": "5"})
+        state.inflight += 1
+        deadline = time.monotonic() + resolved.request_timeout_seconds
+        try:
+            timing = await cached_timing(body.taskId, token, deadline=deadline)
+            if timing is None:
+                raise HTTPException(404, "timing not found")
+            if time.monotonic() >= deadline:
+                raise HTTPException(503, "draft request timed out")
+            try:
+                payload = DraftPayload(
+                    taskId=timing.taskId,
+                    tracks=[
+                        {"lane": track.lane, "fieldName": f"audio:{index}"}
+                        for index, track in enumerate(timing.tracks)
+                    ],
+                    options=body.options,
+                )
+            except ValidationError as exc:
+                raise HTTPException(422, exc.errors(include_context=False, include_input=False)) from exc
+            job = Job(request_id, "draft", payload, "", {}, {}, {},
+                      asyncio.get_running_loop().create_future(),
+                      timing=timing, options=body.options)
+            return await run_job(job, deadline)
+        finally:
+            state.inflight -= 1
+
+    @service.post("/v1/transcribe", response_model=TranscriptionResponse)
+    async def transcribe(request: Request) -> Response | TranscriptionResponse:
         if request.headers.get("x-babel-local-engine") != "1":
             raise HTTPException(403, "local proxy header is required")
+        token = _access_token(request)
         request_id = _request_id(request)
         _check_length(request, resolved.max_request_bytes)
         if state.inflight >= resolved.max_inflight_requests:
@@ -594,59 +854,68 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
                 paths: dict[str, Path] = {}
                 filenames: dict[str, str] = {}
                 types: dict[str, str] = {}
+                audio_digests: list[str] = []
                 for index, track in enumerate(payload.tracks):
                     upload = files[track.fieldName]
                     path = Path(temporary) / f"track-{index}.wav"
-                    await _copy_audio(upload, path, resolved.max_track_bytes, resolved.max_audio_seconds)
+                    audio_digests.append(await _copy_audio(
+                        upload, path, resolved.max_track_bytes, resolved.max_audio_seconds
+                    ))
                     await upload.close()
                     uploads.remove(upload)
                     paths[track.fieldName] = path
                     filenames[track.fieldName] = upload.filename or f"track-{index}.wav"
                     types[track.fieldName] = upload.content_type or "audio/wav"
-                job = Job(request_id, operation, payload, raw_payload, paths, filenames, types,
-                          asyncio.get_running_loop().create_future())
-                state.enqueue(job)
-                responded = False
-                try:
-                    if job.phase == "queued":
-                        try:
-                            await asyncio.wait_for(job.leased.wait(), timeout=min(
-                                resolved.queue_seconds, max(0, deadline - time.monotonic())
-                            ))
-                            remaining = min(
-                                max(0, (job.lease_deadline or 0) - time.monotonic()),
-                                max(0, deadline - time.monotonic()),
-                            )
-                            result = await asyncio.wait_for(job.result, timeout=remaining)
-                        except asyncio.TimeoutError:
-                            result = None
-                        if result is not None:
-                            responded = True
-                            return result
-                    state.release(job)
+                identity = tuple(audio_digests)
+                cached = state.cache.get(payload.taskId, token, identity)
+                if cached is not None:
+                    return cached
+                if state.cache.exists(payload.taskId):
+                    raise HTTPException(409, "task ID already belongs to different audio or credentials")
+                flight = state.timing_flights.get(payload.taskId)
+                if flight is not None:
+                    if flight.audio_digests != identity or not secrets.compare_digest(
+                        flight.token_digest, hashlib.sha256(token.encode()).hexdigest()
+                    ):
+                        raise HTTPException(409, "task ID already belongs to different audio or credentials")
                     try:
-                        state.waiting.remove(job.job_id)
-                    except ValueError:
-                        pass
-                    job.phase = "running"
-                    response = await _backend_request(state, job, deadline)
-                    responded = True
-                    return response
+                        result = await asyncio.wait_for(
+                            asyncio.shield(flight.result), timeout=max(0, deadline - time.monotonic())
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise HTTPException(503, "timing request timed out") from exc
+                    if result is None:
+                        raise HTTPException(503, "timing request failed")
+                    return result.model_copy(update={"accessToken": token})
+                flight = TimingFlight(
+                    hashlib.sha256(token.encode()).hexdigest(), identity,
+                    asyncio.get_running_loop().create_future(),
+                )
+                state.timing_flights[payload.taskId] = flight
+                try:
+                    job = Job(request_id, "transcribe", payload, raw_payload,
+                              paths, filenames, types, asyncio.get_running_loop().create_future())
+                    response = await run_job(job, deadline)
+                    if isinstance(response, Response):
+                        return response
+                    if not isinstance(response, TranscriptionResponse):
+                        raise HTTPException(502, "transcription result has the wrong type")
+                    try:
+                        state.cache.put(response, token, identity)
+                    except ValueError as exc:
+                        raise HTTPException(503, "timing result exceeds cache capacity") from exc
+                    if not flight.result.done():
+                        flight.result.set_result(response)
+                    return response.model_copy(update={"accessToken": token})
                 finally:
-                    state.finish(job, completed=responded)
+                    if not flight.result.done():
+                        flight.result.set_result(None)
+                    state.timing_flights.pop(payload.taskId, None)
         finally:
             try:
                 await asyncio.gather(*(upload.close() for upload in uploads), return_exceptions=True)
             finally:
                 state.inflight -= 1
-
-    @service.post("/v1/draft", response_model=DraftResponse)
-    async def draft(request: Request) -> Response | DraftResponse | TranscriptionResponse:
-        return await infer(request, "draft")
-
-    @service.post("/v1/transcribe", response_model=TranscriptionResponse)
-    async def transcribe(request: Request) -> Response | DraftResponse | TranscriptionResponse:
-        return await infer(request, "transcribe")
 
     return service
 
