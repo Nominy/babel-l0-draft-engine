@@ -59,7 +59,7 @@ def draft_result() -> dict[str, object]:
     return {
         "rows": [{"id": "row-1", "lane": "speaker-1", "startSeconds": 0,
                   "endSeconds": 0.1, "text": "Привет."}],
-        "summary": {"rowCount": 1}, "models": {"asr": "browser", "release": "c-denoise-v3-2026-10-03"},
+        "summary": {"rowCount": 1}, "models": {"asr": "browser", "release": RELEASE_ID},
     }
 
 
@@ -75,7 +75,7 @@ def timing_result(task_id: str = "task-1") -> dict[str, object]:
             {"lane": "speaker-2", "punctuationLabels": [], "tokens": [], "segments": [],
              "sampleRate": 16_000, "pcmSha256": "b" * 64},
         ],
-        "summary": {"tokenCount": 1}, "models": {"asr": "browser", "release": "c-denoise-v3-2026-10-03"},
+        "summary": {"tokenCount": 1}, "models": {"asr": "browser", "release": RELEASE_ID},
     }
 
 
@@ -118,7 +118,7 @@ async def wait_for_status(client: httpx.AsyncClient, request_id: str) -> dict[st
 
 async def register(client: httpx.AsyncClient) -> dict[str, str]:
     response = await client.post(
-        "/v1/workers/register", json={"modelBundleSchema": "babel-browser-model-bundle-v3", "modelRelease": "c-denoise-v3-2026-10-03",
+        "/v1/workers/register", json={"modelBundleSchema": "babel-browser-model-bundle-v3", "modelRelease": RELEASE_ID,
                                       "protocolVersion": 3}
     )
     assert response.status_code == 200, response.text
@@ -531,7 +531,7 @@ async def test_multipart_and_body_limits_prevent_dispatch() -> None:
             "modelBundleSchema": "unsupported", "protocolVersion": 3
         })).status_code == 422
         assert (await client.post("/v1/workers/register", json={
-            "modelBundleSchema": "babel-browser-model-bundle-v3", "modelRelease": "c-denoise-v3-2026-10-03"
+            "modelBundleSchema": "babel-browser-model-bundle-v3", "modelRelease": RELEASE_ID
         })).status_code == 422
         assert (await client.options("/v1/workers/register", headers={
             "Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
