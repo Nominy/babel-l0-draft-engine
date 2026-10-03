@@ -1,7 +1,8 @@
 from __future__ import annotations
+from .release_middleware import InferenceReleaseMiddleware
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import json
 import re
@@ -22,8 +23,10 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Settings
 from .engine import DraftEngine, DraftInputError, ModelUnavailableError
+from .browser_engine import BrowserDraftEngine
+from .inference_release import RELEASE_ID, RELEASE_HEADER, RELEASE_HEADERS, upgrade_detail
 from .inference_queue import DuplicateRequestIdError, InferenceQueue
-from .schemas import DraftPayload, DraftResponse, TranscriptionResponse
+from .schemas import DraftPayload, DraftResponse, DraftTimingRequest, TranscriptionResponse
 
 
 COPY_CHUNK_BYTES = 1024 * 1024
@@ -232,7 +235,7 @@ def create_app(
     settings: Settings | None = None, engine: DraftEngine | None = None
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
-    resolved_engine = engine or DraftEngine(resolved_settings)
+    resolved_engine = engine or (BrowserDraftEngine(resolved_settings) if resolved_settings.inference_runtime == "c-denoise-webgpu" else DraftEngine(resolved_settings))
     inference_queue = InferenceQueue()
     admission_gate = _EventLoopAdmissionGate(
         resolved_settings.max_inflight_requests
@@ -241,6 +244,8 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_service: FastAPI) -> AsyncIterator[None]:
         try:
+            if isinstance(resolved_engine, BrowserDraftEngine):
+                await run_in_threadpool(resolved_engine.prepare)
             yield
         finally:
             await run_in_threadpool(resolved_engine.close)
@@ -251,6 +256,7 @@ def create_app(
     service.add_middleware(
         RequestSizeLimitMiddleware, max_bytes=resolved_settings.max_request_bytes
     )
+    service.add_middleware(InferenceReleaseMiddleware, enforced=resolved_settings.require_current_release)
     service.add_middleware(
         CORSMiddleware,
         allow_origin_regex=ALLOWED_ORIGIN_RE,
@@ -260,6 +266,7 @@ def create_app(
             "Content-Type",
             "X-Babel-Local-Engine",
             "X-Babel-Request-Id",
+            RELEASE_HEADER,
         ],
         expose_headers=["Retry-After"],
         max_age=600,
@@ -279,13 +286,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="request ID not found")
         return status.as_dict()
 
-    async def run_inference(
-        request: Request,
-        inference: Callable[
-            [DraftPayload, dict[str, Path]],
-            DraftResponse | TranscriptionResponse,
-        ],
-    ) -> DraftResponse | TranscriptionResponse:
+    async def run_transcription(request: Request) -> TranscriptionResponse:
         if request.headers.get("x-babel-local-engine") != "1":
             raise HTTPException(status_code=403, detail="local proxy header is required")
         request_id = _request_id(request)
@@ -353,7 +354,7 @@ def create_app(
 
                     try:
                         worker = asyncio.create_task(
-                            run_in_threadpool(inference, payload, paths)
+                            run_in_threadpool(resolved_engine.transcribe, payload, paths)
                         )
                     except BaseException:
                         inference_queue.abandon(ticket)
@@ -383,18 +384,47 @@ def create_app(
                 admission_gate.release()
 
     @service.post("/v1/draft", response_model=DraftResponse)
-    async def draft(request: Request) -> DraftResponse:
-        response = await run_inference(request, resolved_engine.draft)
-        if not isinstance(response, DraftResponse):
-            raise RuntimeError("draft engine returned the wrong response type")
-        return response
+    async def draft(request: Request, body: DraftTimingRequest) -> DraftResponse:
+        if request.headers.get("x-babel-local-engine") != "1":
+            raise HTTPException(status_code=403, detail="local proxy header is required")
+        request_id = _request_id(request)
+        if not admission_gate.try_acquire():
+            raise HTTPException(
+                status_code=429, detail="too many in-flight requests",
+                headers={"Retry-After": "5"},
+            )
+        try:
+            with resolved_engine.model_session():
+                try:
+                    ticket = inference_queue.register(request_id)
+                except DuplicateRequestIdError as exc:
+                    raise HTTPException(status_code=409, detail="request ID is already registered") from exc
+                try:
+                    await ticket.ready.wait()
+                except BaseException:
+                    inference_queue.abandon(ticket)
+                    raise
+                worker = asyncio.create_task(run_in_threadpool(
+                    resolved_engine.draft, body.timing, body.options
+                ))
+                try:
+                    try:
+                        return await asyncio.shield(worker)
+                    except asyncio.CancelledError as exc:
+                        await _finish_cancelled_worker(worker)
+                        raise exc
+                except DraftInputError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                except ModelUnavailableError as exc:
+                    raise HTTPException(status_code=503, detail=str(exc)) from exc
+                finally:
+                    inference_queue.complete(ticket)
+        finally:
+            admission_gate.release()
 
     @service.post("/v1/transcribe", response_model=TranscriptionResponse)
     async def transcribe(request: Request) -> TranscriptionResponse:
-        response = await run_inference(request, resolved_engine.transcribe)
-        if not isinstance(response, TranscriptionResponse):
-            raise RuntimeError("transcription engine returned the wrong response type")
-        return response
+        return await run_transcription(request)
 
     return service
 
