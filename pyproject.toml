@@ -15,5 +15,8 @@ dependencies = {file = ["requirements.txt"]}
 [tool.setuptools.packages.find]
 include = ["l0_draft_engine*"]
 
+[tool.setuptools.package-data]
+l0_draft_engine = ["inference_release.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

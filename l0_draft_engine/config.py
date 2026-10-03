@@ -55,8 +55,12 @@ class Settings:
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
     max_inflight_requests: int = 3
     model_idle_seconds: int = 300
+    inference_runtime: str = "legacy"
+    require_current_release: bool = False
 
     def __post_init__(self) -> None:
+        if self.inference_runtime not in {"legacy", "c-denoise-webgpu"}:
+            raise SettingsError("LOCAL_ENGINE_RUNTIME must be legacy or c-denoise-webgpu")
         if self.host not in {"127.0.0.1", "localhost", "::1"}:
             raise SettingsError("LOCAL_ENGINE_HOST must be a loopback host")
         if self.device not in {"mps", "cuda", "cpu"}:
@@ -88,6 +92,8 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
+            inference_runtime=os.environ.get("LOCAL_ENGINE_RUNTIME", "c-denoise-webgpu"),
+            require_current_release=os.environ.get("LOCAL_ENGINE_REQUIRE_CURRENT_RELEASE", "0") == "1",
             host=os.environ.get("LOCAL_ENGINE_HOST", "127.0.0.1").strip(),
             port=_env_int("LOCAL_ENGINE_PORT", 8767, 1, 65535),
             device=os.environ.get("LOCAL_ENGINE_DEVICE", _default_device()).strip().lower(),

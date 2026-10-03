@@ -1,0 +1,12 @@
+{
+  "id": "c-denoise-v3-2026-10-03",
+  "protocolVersion": 3,
+  "bundleSchema": "babel-browser-model-bundle-v3",
+  "minimumExtensionVersion": "0.2.41",
+  "modelBaseUrl": "https://reviewgen.ovh/browser-model/c-denoise-v3-2026-10-03",
+  "graphs": {
+    "asr/v3_ctc.onnx": "9b961f294a2018453e5c60b4550c70a3ca7ba02a800d2ada195865e05b82a82a",
+    "punctuation/context.fp16.onnx": "f0c3f98265535c0e1c45e66f862202925c6ceb6a17e69a53ac527898bcc6b0ec",
+    "punctuation/denoise.fp16.onnx": "fd69e97fecf7ac9e96b1007981a32be8d01fa3b0d2e1aa74a7a19297630093d1"
+  }
+}

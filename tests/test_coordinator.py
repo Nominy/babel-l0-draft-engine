@@ -12,6 +12,7 @@ import pytest
 
 from l0_draft_engine.coordinator import CoordinatorSettings, TimingCache, create_app
 from l0_draft_engine.schemas import TranscriptionResponse
+from l0_draft_engine.inference_release import RELEASE_ID
 
 
 TOKEN = "a" * 43
@@ -58,7 +59,7 @@ def draft_result() -> dict[str, object]:
     return {
         "rows": [{"id": "row-1", "lane": "speaker-1", "startSeconds": 0,
                   "endSeconds": 0.1, "text": "Привет."}],
-        "summary": {"rowCount": 1}, "models": {"asr": "browser"},
+        "summary": {"rowCount": 1}, "models": {"asr": "browser", "release": "c-denoise-v3-2026-10-03"},
     }
 
 
@@ -66,15 +67,15 @@ def timing_result(task_id: str = "task-1") -> dict[str, object]:
     return {
         "taskId": task_id,
         "tracks": [
-            {"lane": "speaker-1", "tokens": [{"id": "token-1", "text": "Привет",
+            {"lane": "speaker-1", "punctuationLabels": [2], "tokens": [{"id": "token-1", "text": "Привет",
                                                  "startSeconds": 0, "endSeconds": 0.1}],
              "segments": [{"id": "segment-1", "startSeconds": 0, "endSeconds": 0.1,
                            "startSample": 0, "endSample": 1600, "sampleRate": 16_000}],
              "sampleRate": 16_000, "pcmSha256": "a" * 64},
-            {"lane": "speaker-2", "tokens": [], "segments": [],
+            {"lane": "speaker-2", "punctuationLabels": [], "tokens": [], "segments": [],
              "sampleRate": 16_000, "pcmSha256": "b" * 64},
         ],
-        "summary": {"tokenCount": 1}, "models": {"asr": "browser"},
+        "summary": {"tokenCount": 1}, "models": {"asr": "browser", "release": "c-denoise-v3-2026-10-03"},
     }
 
 
@@ -117,8 +118,8 @@ async def wait_for_status(client: httpx.AsyncClient, request_id: str) -> dict[st
 
 async def register(client: httpx.AsyncClient) -> dict[str, str]:
     response = await client.post(
-        "/v1/workers/register", json={"modelBundleSchema": "babel-browser-model-bundle-v2",
-                                      "protocolVersion": 2}
+        "/v1/workers/register", json={"modelBundleSchema": "babel-browser-model-bundle-v3", "modelRelease": "c-denoise-v3-2026-10-03",
+                                      "protocolVersion": 3}
     )
     assert response.status_code == 200, response.text
     return response.json()
@@ -346,6 +347,7 @@ async def test_idle_fallback_preserves_payload_and_backend_queue_status() -> Non
         if request.url.path == "/health":
             return httpx.Response(200, json={"ok": True, "device": "cuda", "models": {"asr": {}}})
         if request.url.path.startswith("/v1/queue/"):
+            assert request.headers["x-babel-inference-release"] == RELEASE_ID
             return httpx.Response(200, json={"requestId": "fallback", "status": "queued",
                                               "position": 2, "queuedCount": 2})
         seen.append((request, await request.aread()))
@@ -526,10 +528,10 @@ async def test_multipart_and_body_limits_prevent_dispatch() -> None:
         })).status_code == 413
         assert (await client.post("/v1/transcribe", content=b"no-header")).status_code == 403
         assert (await client.post("/v1/workers/register", json={
-            "modelBundleSchema": "unsupported", "protocolVersion": 2
+            "modelBundleSchema": "unsupported", "protocolVersion": 3
         })).status_code == 422
         assert (await client.post("/v1/workers/register", json={
-            "modelBundleSchema": "babel-browser-model-bundle-v2"
+            "modelBundleSchema": "babel-browser-model-bundle-v3", "modelRelease": "c-denoise-v3-2026-10-03"
         })).status_code == 422
         assert (await client.options("/v1/workers/register", headers={
             "Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop",

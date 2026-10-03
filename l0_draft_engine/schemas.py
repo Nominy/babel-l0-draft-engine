@@ -5,7 +5,7 @@ import re
 import unicodedata
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 
 SAFE_NAME_RE = re.compile(r"^[\w.:-]+$", re.UNICODE)
@@ -176,6 +176,7 @@ class TranscriptionTrack(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     lane: str
+    punctuationLabels: list[StrictInt] | None = None
     tokens: list[TranscriptionToken]
     segments: list[TimingSegment]
     pcmSha256: str = Field(pattern=r"^[0-9a-f]{64}$")

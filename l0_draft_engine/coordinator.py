@@ -6,6 +6,7 @@ are deliberately in-memory and cannot be shared between processes.
 """
 
 from __future__ import annotations
+from .release_middleware import InferenceReleaseMiddleware
 
 import asyncio
 from contextlib import ExitStack, asynccontextmanager
@@ -34,6 +35,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .schemas import DraftOptions, DraftPayload, DraftResponse, TranscriptionResponse
+from .inference_release import RELEASE_ID, RELEASE, RELEASE_HEADERS, RELEASE_HEADER, validate_punctuated_timing, upgrade_detail
 
 
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
@@ -71,6 +73,7 @@ class CoordinatorSettings:
     request_timeout_seconds: float = 895.0  # below the public Apache 900-second timeout
     cache_dir: Path = field(default_factory=lambda: Path.home() / ".cache" / "babel" / "timing")
     cache_max_bytes: int = 4 * 1024**3
+    require_current_release: bool = False
 
     def __post_init__(self) -> None:
         if not self.backend_urls or any(
@@ -96,6 +99,7 @@ class CoordinatorSettings:
         urls = os.environ.get("COORDINATOR_BACKEND_URLS")
         defaults = cls()
         return cls(
+            require_current_release=os.environ.get("COORDINATOR_REQUIRE_CURRENT_RELEASE", "0") == "1",
             backend_urls=tuple(url.strip().rstrip("/") for url in urls.split(",") if url.strip())
             if urls is not None else defaults.backend_urls,
             max_track_bytes=_positive_env("COORDINATOR_MAX_TRACK_BYTES", defaults.max_track_bytes),
@@ -251,8 +255,16 @@ class TaskBody(BaseModel):
 
 class RegisterBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    modelBundleSchema: Literal["babel-browser-model-bundle-v2"]
-    protocolVersion: Literal[2]
+    modelBundleSchema: Literal["babel-browser-model-bundle-v3"]
+    protocolVersion: Literal[3]
+    modelRelease: str
+
+    @field_validator("modelRelease")
+    @classmethod
+    def current_model_release(cls, value: str) -> str:
+        if value != RELEASE_ID:
+            raise ValueError("worker model update is required")
+        return value
 
 
 class WorkerBody(BaseModel):
@@ -321,7 +333,7 @@ class TimingCache:
         try:
             timing = TranscriptionResponse.model_validate(record["timing"])
             if (
-                record["version"] != 2
+                record["version"] != 3 or record.get("releaseId") != RELEASE_ID
                 or record["taskId"] != task_id or timing.taskId != task_id
                 or not isinstance(record["tokenDigest"], str)
                 or not re.fullmatch(r"[0-9a-f]{64}", record["tokenDigest"])
@@ -345,7 +357,8 @@ class TimingCache:
     def put(self, timing: TranscriptionResponse, token: str, input_digest: str) -> None:
         key = _timing_key(timing.taskId, token)
         data = json.dumps({
-            "version": 2,
+            "version": 3,
+            "releaseId": RELEASE_ID,
             "taskId": timing.taskId,
             "tokenDigest": key[1],
             "inputDigest": input_digest,
@@ -502,10 +515,12 @@ class Coordinator:
         return None
 
 
-def _validated_result(job: Job, value: dict[str, object]) -> DraftResponse | TranscriptionResponse:
+def _validated_result(job: Job, value: dict[str, object], require_current_release: bool = False) -> DraftResponse | TranscriptionResponse:
     json.dumps(value, allow_nan=False)
     if job.operation == "draft":
         result = DraftResponse.model_validate(value)
+        if require_current_release and result.models.get("release") != RELEASE_ID:
+            raise ValueError("draft result belongs to an outdated release")
         lanes = {track.lane for track in job.payload.tracks}
         if any(row.lane not in lanes or not math.isfinite(row.startSeconds)
                or not math.isfinite(row.endSeconds) or row.startSeconds < 0
@@ -515,6 +530,8 @@ def _validated_result(job: Job, value: dict[str, object]) -> DraftResponse | Tra
             raise ValueError("draft row IDs must be unique")
         return result
     result = TranscriptionResponse.model_validate(value)
+    if require_current_release:
+        validate_punctuated_timing(result)
     if result.taskId != job.payload.taskId or [track.lane for track in result.tracks] != [
         track.lane for track in job.payload.tracks
     ]:
@@ -549,7 +566,7 @@ async def _backend_request(coordinator: Coordinator, job: Job, deadline: float) 
                             "timing": job.timing.model_dump(exclude={"accessToken"}),
                             **({"options": job.options.model_dump(exclude_none=True)} if job.options else {}),
                         },
-                        headers={"X-Babel-Local-Engine": "1", "X-Babel-Request-Id": job.request_id},
+                        headers={**RELEASE_HEADERS, "X-Babel-Local-Engine": "1", "X-Babel-Request-Id": job.request_id},
                         timeout=httpx.Timeout(timeout, connect=min(5.0, timeout)),
                     ),
                     timeout=remaining,
@@ -569,7 +586,7 @@ async def _backend_request(coordinator: Coordinator, job: Job, deadline: float) 
                             f"{base}/v1/transcribe",
                             data={"payload": job.raw_payload},
                             files=files,
-                            headers={"X-Babel-Local-Engine": "1", "X-Babel-Request-Id": job.request_id},
+                            headers={**RELEASE_HEADERS, "X-Babel-Local-Engine": "1", "X-Babel-Request-Id": job.request_id},
                             timeout=httpx.Timeout(timeout, connect=min(5.0, timeout)),
                         ),
                         timeout=remaining,
@@ -605,16 +622,21 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
                 await transport.aclose()
     service = FastAPI(title="Babel L0 Inference Coordinator", version="1.0.0", lifespan=lifespan)
     service.add_middleware(BodyLimitMiddleware, max_bytes=resolved.max_request_bytes)
+    service.add_middleware(InferenceReleaseMiddleware, enforced=resolved.require_current_release)
     service.add_middleware(
         CORSMiddleware,
         allow_origin_regex=ALLOWED_ORIGIN_RE,
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type", "Authorization", "X-Babel-Local-Engine", "X-Babel-Request-Id"],
+        allow_headers=["Content-Type", "Authorization", "X-Babel-Local-Engine", "X-Babel-Request-Id", RELEASE_HEADER],
         expose_headers=["Retry-After"],
         max_age=600,
     )
     service.state.coordinator = state
+
+    @service.get("/v1/inference-release")
+    async def inference_release():
+        return {**RELEASE, "enforced": resolved.require_current_release}
 
 
     @service.get("/health")
@@ -628,6 +650,8 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
                 if upstream.is_success:
                     report = upstream.json()
                     if isinstance(report, dict) and report.get("ok") is True:
+                        if resolved.require_current_release and report.get("release") != RELEASE_ID:
+                            continue
                         return {**report, "swarm": swarm}
             except (httpx.TransportError, ValueError):
                 continue
@@ -642,7 +666,7 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
             try:
                 upstream = await transport.get(
                     f"{job.backend_url}/v1/queue/{quote(request_id, safe='')}", timeout=5.0,
-                    headers={"X-Babel-Local-Engine": "1"},
+                    headers={**RELEASE_HEADERS, "X-Babel-Local-Engine": "1"},
                 )
                 if upstream.is_success:
                     return upstream.json()
@@ -653,7 +677,7 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
                 try:
                     upstream = await transport.get(
                         f"{base}/v1/queue/{quote(request_id, safe='')}", timeout=2.0,
-                        headers={"X-Babel-Local-Engine": "1"},
+                        headers={**RELEASE_HEADERS, "X-Babel-Local-Engine": "1"},
                     )
                     if upstream.is_success:
                         return upstream.json()
@@ -737,7 +761,7 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
             state.fail(job)
             return {"ok": True}
         try:
-            result = _validated_result(job, body.result)
+            result = _validated_result(job, body.result, resolved.require_current_release)
         except (ValidationError, ValueError) as exc:
             state.fail(job)
             raise HTTPException(422, "worker result does not match the request") from exc
@@ -776,7 +800,7 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
                 responded = True
                 return response
             try:
-                result = _validated_result(job, json.loads(response.body))
+                result = _validated_result(job, json.loads(response.body), resolved.require_current_release)
             except (ValueError, ValidationError, TypeError) as exc:
                 raise HTTPException(502, "trusted inference result is invalid") from exc
             responded = True
@@ -789,6 +813,11 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
     ) -> TranscriptionResponse | None:
         cached = state.cache.get(task_id, token)
         if cached is not None:
+            if resolved.require_current_release:
+                try:
+                    validate_punctuated_timing(cached)
+                except ValueError:
+                    return None
             return cached
         flight = state.timing_flights.get(_timing_key(task_id, token))
         if flight is None:

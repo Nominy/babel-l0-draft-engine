@@ -5,6 +5,7 @@ param(
     [ValidateRange(1, 65535)][int]$Port = 8767,
     # Pristine deployed checkout the failover serves; defaults to this repo.
     [string]$EngineRoot = "",
+    [string]$EngineStartScript = "Start-Windows.ps1",
     [string]$TunnelTarget = "root@93.127.223.38",
     [ValidateRange(1, 65535)][int]$TunnelRemotePort = 28767,
     [switch]$Remove
@@ -75,6 +76,7 @@ function Register-DurableTask {
 }
 
 $engineArguments = @("-Mode", "engine", "-Port", $Port)
+$engineArguments += @("-EngineStartScript", $EngineStartScript)
 if ($EngineRoot) {
     $resolvedEngineRoot = (Resolve-Path -LiteralPath $EngineRoot).Path
     $engineArguments += @("-EngineRoot", $resolvedEngineRoot)

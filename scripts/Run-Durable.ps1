@@ -5,6 +5,7 @@ param(
     # Deployed revision to serve. The failover must match the homeserver's
     # committed checkout, never an in-progress working tree.
     [string]$EngineRoot = "",
+    [string]$EngineStartScript = "Start-Windows.ps1",
     [string]$TunnelTarget = "root@93.127.223.38",
     [ValidateRange(1, 65535)][int]$TunnelRemotePort = 28767,
     [ValidateRange(1, 3600)][int]$MinBackoffSeconds = 5,
@@ -45,7 +46,7 @@ function Write-Log {
 function Get-Attempt {
     if ($Mode -eq "engine") {
         $engineHome = if ($EngineRoot) { $EngineRoot } else { $RepoRoot }
-        $startScript = Join-Path $engineHome "scripts\Start-Windows.ps1"
+        $startScript = Join-Path (Join-Path $engineHome "scripts") $EngineStartScript
         if (-not (Test-Path $startScript)) {
             throw "Engine launcher is missing: $startScript"
         }

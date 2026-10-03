@@ -830,3 +830,9 @@ async def test_coordinator_trusted_timing_then_punctuation_never_repeats_asr(
         assert (await client.post("/v1/draft", json=preserved, headers=bearer)).status_code == 422
         assert len(asr.calls) == 2
     await upstream.aclose()
+
+
+@pytest.fixture
+def anyio_backend():
+    # The coordinator and server queues run on asyncio under uvicorn.
+    return "asyncio"

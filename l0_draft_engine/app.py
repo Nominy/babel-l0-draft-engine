@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .release_middleware import InferenceReleaseMiddleware
 
 import asyncio
 from collections.abc import AsyncIterator
@@ -22,6 +23,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Settings
 from .engine import DraftEngine, DraftInputError, ModelUnavailableError
+from .browser_engine import BrowserDraftEngine
+from .inference_release import RELEASE_ID, RELEASE_HEADER, RELEASE_HEADERS, upgrade_detail
 from .inference_queue import DuplicateRequestIdError, InferenceQueue
 from .schemas import DraftPayload, DraftResponse, DraftTimingRequest, TranscriptionResponse
 
@@ -232,7 +235,7 @@ def create_app(
     settings: Settings | None = None, engine: DraftEngine | None = None
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
-    resolved_engine = engine or DraftEngine(resolved_settings)
+    resolved_engine = engine or (BrowserDraftEngine(resolved_settings) if resolved_settings.inference_runtime == "c-denoise-webgpu" else DraftEngine(resolved_settings))
     inference_queue = InferenceQueue()
     admission_gate = _EventLoopAdmissionGate(
         resolved_settings.max_inflight_requests
@@ -241,6 +244,8 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_service: FastAPI) -> AsyncIterator[None]:
         try:
+            if isinstance(resolved_engine, BrowserDraftEngine):
+                await run_in_threadpool(resolved_engine.prepare)
             yield
         finally:
             await run_in_threadpool(resolved_engine.close)
@@ -251,6 +256,7 @@ def create_app(
     service.add_middleware(
         RequestSizeLimitMiddleware, max_bytes=resolved_settings.max_request_bytes
     )
+    service.add_middleware(InferenceReleaseMiddleware, enforced=resolved_settings.require_current_release)
     service.add_middleware(
         CORSMiddleware,
         allow_origin_regex=ALLOWED_ORIGIN_RE,
@@ -260,6 +266,7 @@ def create_app(
             "Content-Type",
             "X-Babel-Local-Engine",
             "X-Babel-Request-Id",
+            RELEASE_HEADER,
         ],
         expose_headers=["Retry-After"],
         max_age=600,

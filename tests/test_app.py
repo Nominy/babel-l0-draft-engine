@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import sys
 import threading
+from types import SimpleNamespace
 import wave
 from pathlib import Path
 
@@ -193,7 +195,10 @@ def test_track_lane_preserves_length_limit() -> None:
 
 
 @pytest.mark.anyio
-async def test_health_does_not_load_models(tmp_path: Path) -> None:
+async def test_health_does_not_load_models(tmp_path: Path, monkeypatch) -> None:
+    # This tests model residency, independently of optional legacy runtimes.
+    monkeypatch.setattr("l0_draft_engine.engine.find_spec", lambda _name: object())
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
     called = False
 
     def forbidden_factory():
@@ -690,7 +695,7 @@ async def test_accepted_upload_keeps_models_resident_until_request_finishes() ->
     async def uploading_body():
         upload_started.set()
         await release_upload.wait()
-        yield b"--upload-end--\r\n"
+        yield b'--upload-end\r\nContent-Disposition: form-data; name="payload"\r\n\r\n{}\r\n--upload-end--\r\n'
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
