@@ -3,6 +3,9 @@
 Run with ``uvicorn l0_draft_engine.coordinator:app`` after installing
 ``requirements-coordinator.txt``. Keep one uvicorn process: leases and status
 are deliberately in-memory and cannot be shared between processes.
+Enhancement uses this same worker registry, but never trusted ASR fallback or the
+timing cache. Its owner capability protects status and its temporary WAV pair is
+retained only until the multipart response completes or the owner disconnects.
 """
 
 from __future__ import annotations
@@ -35,6 +38,11 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .schemas import DraftOptions, DraftPayload, DraftResponse, TranscriptionResponse
+from .enhancement import (
+    EnhancementModel, EnhancementPayload, EnhancementProgress, EnhancementResponse,
+    EnhancementResult, copy_audio as copy_enhancement_audio,
+    parse_multipart as parse_enhancement_multipart, read_multipart as read_enhancement_multipart,
+)
 from .inference_release import RELEASE_ID, RELEASE, RELEASE_HEADERS, RELEASE_HEADER, validate_punctuated_timing, upgrade_detail
 
 
@@ -129,7 +137,15 @@ class BodyLimitMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        limit = WORKER_BODY_BYTES if scope["path"].startswith(("/v1/workers/", "/v1/jobs/")) else self.max_bytes
+        multipart_completion = (
+            scope["path"].startswith("/v1/jobs/") and scope["path"].endswith("/complete")
+            and dict(scope.get("headers", [])).get(b"content-type", b"").lower().startswith(b"multipart/form-data")
+        )
+        limit = (
+            WORKER_BODY_BYTES
+            if scope["path"].startswith(("/v1/workers/", "/v1/jobs/")) and not multipart_completion
+            else self.max_bytes
+        )
         count = 0
         started = False
 
@@ -258,6 +274,18 @@ class RegisterBody(BaseModel):
     modelBundleSchema: Literal["babel-browser-model-bundle-v3"]
     protocolVersion: Literal[3]
     modelRelease: str
+    operations: list[Literal["transcribe", "draft", "enhance"]] = Field(
+        default_factory=lambda: ["transcribe", "draft"], min_length=1, max_length=3,
+    )
+    enhancementModel: EnhancementModel | None = None
+
+    @model_validator(mode="after")
+    def consistent_capabilities(self) -> RegisterBody:
+        if len(set(self.operations)) != len(self.operations):
+            raise ValueError("worker operations must be distinct")
+        if ("enhance" in self.operations) != (self.enhancementModel is not None):
+            raise ValueError("enhancement operation requires exactly one model capability")
+        return self
 
     @field_validator("modelRelease")
     @classmethod
@@ -284,6 +312,16 @@ class CompleteBody(WorkerBody):
             raise ValueError("exactly one of result or error is required")
         return self
 
+
+
+class EnhancementCompleteBody(WorkerBody):
+    leaseToken: str
+    result: EnhancementResult
+
+
+class ProgressBody(WorkerBody):
+    leaseToken: str
+    progress: EnhancementProgress
 
 def _timing_key(task_id: str, token: str) -> tuple[str, str]:
     return task_id, hashlib.sha256(token.encode()).hexdigest()
@@ -402,18 +440,25 @@ class Worker:
     token: str
     last_seen: float
     job_id: str | None = None
+    operations: tuple[str, ...] = ("transcribe", "draft")
+    enhancement_model: EnhancementModel | None = None
+
+    def accepts(self, job: Job) -> bool:
+        return job.operation in self.operations and (
+            job.operation != "enhance" or self.enhancement_model == job.payload.model
+        )
 
 
 @dataclass
 class Job:
     request_id: str
-    operation: Literal["draft", "transcribe"]
-    payload: DraftPayload
+    operation: Literal["draft", "transcribe", "enhance"]
+    payload: DraftPayload | EnhancementPayload
     raw_payload: str
     paths: dict[str, Path]
     filenames: dict[str, str]
     types: dict[str, str]
-    result: asyncio.Future[DraftResponse | TranscriptionResponse | None]
+    result: asyncio.Future[DraftResponse | TranscriptionResponse | EnhancementResult | None]
     timing: TranscriptionResponse | None = None
     options: DraftOptions | None = None
     leased: asyncio.Event = field(default_factory=asyncio.Event)
@@ -423,6 +468,11 @@ class Job:
     lease_deadline: float | None = None
     backend_url: str | None = None
     phase: Literal["queued", "running"] = "queued"
+    owner_digest: str | None = None
+    progress: EnhancementProgress | None = None
+    output_paths: dict[str, Path] = field(default_factory=dict)
+    io_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    io_task: asyncio.Task | None = None
 
 
 class Coordinator:
@@ -435,7 +485,7 @@ class Coordinator:
         self.jobs: dict[str, Job] = {}
         self.by_request_id: dict[str, Job] = {}
         self.waiting: deque[str] = deque()
-        self.completed: OrderedDict[str, float] = OrderedDict()
+        self.completed: OrderedDict[str, tuple[float, str | None]] = OrderedDict()
         self.inflight = 0
 
     def prune(self) -> None:
@@ -444,15 +494,23 @@ class Coordinator:
             if worker.job_id is None and now - worker.last_seen > self.settings.worker_idle_seconds:
                 del self.workers[worker_id]
         while self.completed:
-            _, expiry = next(iter(self.completed.items()))
+            _, (expiry, _) = next(iter(self.completed.items()))
             if expiry > now and len(self.completed) <= 1024:
                 break
             self.completed.popitem(last=False)
 
-    def idle_capacity(self) -> bool:
+    def idle_capacity(self, job: Job | None = None) -> bool:
         self.prune()
-        idle = sum(worker.job_id is None for worker in self.workers.values())
-        return idle > len(self.waiting)
+        idle = sum(
+            worker.job_id is None and (worker.accepts(job) if job else
+                                      bool(set(worker.operations) & {"transcribe", "draft"}))
+            for worker in self.workers.values()
+        )
+        waiting = sum(
+            queued_id in self.jobs and self.jobs[queued_id].operation != "enhance"
+            for queued_id in self.waiting
+        )
+        return idle > waiting
 
     def enqueue(self, job: Job) -> None:
         self.prune()
@@ -460,7 +518,7 @@ class Coordinator:
             raise HTTPException(409, "request ID is already registered")
         self.jobs[job.job_id] = job
         self.by_request_id[job.request_id] = job
-        if self.idle_capacity():
+        if job.operation == "enhance" or self.idle_capacity(job):
             self.waiting.append(job.job_id)
         else:
             job.phase = "running"  # direct backend failover; never queue without a worker
@@ -478,6 +536,7 @@ class Coordinator:
         self.release(job)
         if not job.result.done():
             job.result.set_result(None)
+        job.leased.set()  # Wake queued enhancement on cancellation/failure too.
 
     def finish(self, job: Job, *, completed: bool) -> None:
         self.release(job)
@@ -488,7 +547,7 @@ class Coordinator:
         except ValueError:
             pass
         if completed:
-            self.completed[job.request_id] = time.monotonic() + 45
+            self.completed[job.request_id] = (time.monotonic() + 45, job.owner_digest)
         self.prune()
 
     def authenticate(self, worker_id: str, token: str) -> Worker:
@@ -497,9 +556,14 @@ class Coordinator:
             raise HTTPException(401, "worker credentials are invalid")
         return worker
 
-    def status(self, request_id: str) -> dict[str, str | int] | None:
+    def status(self, request_id: str, token: str | None = None) -> dict[str, object] | None:
         self.prune()
         job = self.by_request_id.get(request_id)
+        owner_digest = job.owner_digest if job else self.completed.get(request_id, (0, None))[1]
+        if owner_digest is not None and (
+            token is None or not secrets.compare_digest(owner_digest, hashlib.sha256(token.encode()).hexdigest())
+        ):
+            raise HTTPException(404, "request ID not found")
         if job is not None:
             position = 0
             if job.phase == "queued":
@@ -508,7 +572,8 @@ class Coordinator:
                 except ValueError:
                     pass
             return {"requestId": request_id, "status": job.phase,
-                    "position": position, "queuedCount": len(self.waiting)}
+                    "position": position, "queuedCount": len(self.waiting),
+                    **({"progress": job.progress.model_dump()} if job.progress is not None else {})}
         if request_id in self.completed:
             return {"requestId": request_id, "status": "completed", "position": 0,
                     "queuedCount": len(self.waiting)}
@@ -548,6 +613,8 @@ def _validated_result(job: Job, value: dict[str, object], require_current_releas
 
 
 async def _backend_request(coordinator: Coordinator, job: Job, deadline: float) -> Response:
+    if job.operation == "enhance":
+        raise HTTPException(503, "enhancement requires a matching WebGPU volunteer; Originals are unchanged")
     last_failure: httpx.Response | None = None
     for base in coordinator.settings.backend_urls:
         remaining = deadline - time.monotonic()
@@ -659,8 +726,12 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
                 "swarm": swarm, "backendsAvailable": False}
 
     @service.get("/v1/queue/{request_id}")
-    async def queue_status(request_id: str) -> dict[str, str | int]:
-        status = state.status(request_id)
+    async def queue_status(request_id: str, request: Request) -> dict[str, object]:
+        token = _access_token(request, required=False)
+        status = state.status(request_id, token)
+        if status is None and request.headers.get("authorization") is not None:
+            # Private enhancement polling must not leak an unknown owner request to ASR backends.
+            raise HTTPException(404, "request ID not found")
         job = state.by_request_id.get(request_id)
         if job is not None and job.backend_url is not None:
             try:
@@ -692,7 +763,10 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
         state.prune()
         worker_id = str(uuid.uuid4())
         token = secrets.token_urlsafe(32)
-        state.workers[worker_id] = Worker(token, time.monotonic())
+        state.workers[worker_id] = Worker(
+            token, time.monotonic(), operations=tuple(body.operations),
+            enhancement_model=body.enhancementModel,
+        )
         return {"workerId": worker_id, "token": token}
 
     @service.post("/v1/workers/lease", response_model=None)
@@ -701,10 +775,14 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
         worker.last_seen = time.monotonic()
         if worker.job_id is not None:
             return Response(status_code=204)
-        while state.waiting:
-            job = state.jobs.get(state.waiting.popleft())
+        for job_id in tuple(state.waiting):
+            job = state.jobs.get(job_id)
             if job is None or job.result.done():
+                state.waiting.remove(job_id)
                 continue
+            if not worker.accepts(job):
+                continue
+            state.waiting.remove(job_id)
             worker.job_id = job.job_id
             job.worker_id = body.workerId
             job.lease_token = secrets.token_urlsafe(32)
@@ -725,7 +803,7 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
                     {"fieldName": track.fieldName,
                      "url": f"/v1/jobs/{job.job_id}/audio/{quote(track.fieldName, safe='')}"}
                     for track in job.payload.tracks
-                ] if job.operation == "transcribe" else [],
+                ] if job.operation in ("transcribe", "enhance") else [],
             }
         return Response(status_code=204)
 
@@ -740,6 +818,17 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
             raise HTTPException(404, "job lease expired")
         return job
 
+    class EnhancementAudioResponse(FileResponse):
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            # Cleanup must not remove an input while a worker download holds it open.
+            async with self.job.io_lock:
+                authorized_job(self.job.job_id, self.lease_token)
+                self.job.io_task = asyncio.current_task()
+                try:
+                    await super().__call__(scope, receive, send)
+                finally:
+                    self.job.io_task = None
+
     @service.get("/v1/jobs/{job_id}/audio/{field_name}")
     async def job_audio(job_id: str, field_name: str, request: Request) -> FileResponse:
         authorization = request.headers.get("authorization", "")
@@ -749,17 +838,98 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
         path = job.paths.get(field_name)
         if path is None:
             raise HTTPException(404, "audio field not found")
+        if job.operation == "enhance":
+            response = EnhancementAudioResponse(
+                path, media_type="audio/wav", filename=job.filenames[field_name],
+                headers={"Cache-Control": "no-store"},
+            )
+            response.job = job
+            response.lease_token = authorization[7:]
+            return response
         return FileResponse(path, media_type="audio/wav", filename=job.filenames[field_name])
 
-    @service.post("/v1/jobs/{job_id}/complete")
-    async def complete(job_id: str, body: CompleteBody) -> dict[str, bool]:
+    def worker_job(job_id: str, body: WorkerBody, lease_token: str) -> Job:
         state.authenticate(body.workerId, body.token)
-        job = authorized_job(job_id, body.leaseToken)
+        job = authorized_job(job_id, lease_token)
         if job.worker_id != body.workerId:
             raise HTTPException(403, "lease belongs to another worker")
+        return job
+
+    @service.post("/v1/jobs/{job_id}/progress")
+    async def progress(job_id: str, body: ProgressBody) -> dict[str, bool]:
+        job = worker_job(job_id, body, body.leaseToken)
+        if job.operation != "enhance":
+            raise HTTPException(422, "only enhancement jobs publish this progress")
+        try:
+            body.progress.validate_update(job.payload, job.progress)
+        except ValueError as exc:
+            raise HTTPException(422, "invalid or regressing enhancement progress") from exc
+        job.progress = body.progress
+        return {"ok": True}
+
+    @service.post("/v1/jobs/{job_id}/complete")
+    async def complete(job_id: str, request: Request) -> dict[str, bool]:
+        if request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
+            authorization = request.headers.get("authorization", "")
+            if not authorization.startswith("Bearer "):
+                raise HTTPException(401, "lease bearer token is required")
+            job = authorized_job(job_id, authorization[7:])
+            if job.operation != "enhance":
+                raise HTTPException(422, "multipart completion is only for enhancement")
+            _check_length(request, resolved.max_request_bytes)
+            # Serialize result writers with downloads and cancellation cleanup.
+            async with job.io_lock:
+                authorized_job(job_id, authorization[7:])
+                job.io_task = asyncio.current_task()
+                try:
+                    form = await read_enhancement_multipart(request)
+                    try:
+                        body, files = parse_enhancement_multipart(form, EnhancementCompleteBody)
+                        authenticated = worker_job(job_id, body, body.leaseToken)
+                        if authenticated is not job:
+                            raise HTTPException(404, "job lease not found")
+                        body.result.validate_request(job.payload)
+                        for index, (track, metadata) in enumerate(zip(
+                            job.payload.tracks, body.result.tracks, strict=True
+                        )):
+                            path = job.paths[track.fieldName].parent / f"enhanced-{index}.wav"
+                            await copy_enhancement_audio(
+                                files[track.fieldName], path, metadata,
+                                max_bytes=resolved.max_track_bytes,
+                                max_seconds=resolved.max_audio_seconds, output=True,
+                            )
+                            job.output_paths[track.fieldName] = path
+                        # The owner may have disconnected or the lease expired during upload.
+                        worker_job(job_id, body, body.leaseToken)
+                        state.release(job)
+                        job.result.set_result(body.result)
+                    finally:
+                        await form.close()
+                except HTTPException as exc:
+                    if exc.status_code not in (401, 403, 404):
+                        state.fail(job)
+                    raise
+                except (ValueError, ValidationError) as exc:
+                    state.fail(job)
+                    raise HTTPException(422, "worker result does not match the request") from exc
+                except BaseException:
+                    state.fail(job)
+                    raise
+                finally:
+                    job.io_task = None
+            return {"ok": True}
+        _check_length(request, WORKER_BODY_BYTES)
+        try:
+            body = CompleteBody.model_validate(await request.json())
+        except (ValueError, ValidationError) as exc:
+            raise HTTPException(422, "invalid worker completion") from exc
+        job = worker_job(job_id, body, body.leaseToken)
         if body.error is not None:
             state.fail(job)
             return {"ok": True}
+        if job.operation == "enhance":
+            state.fail(job)
+            raise HTTPException(422, "enhancement requires multipart WAV completion")
         try:
             result = _validated_result(job, body.result, resolved.require_current_release)
         except (ValidationError, ValueError) as exc:
@@ -769,6 +939,123 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
         if not job.result.done():
             job.result.set_result(result)
         return {"ok": True}
+
+    async def wait_for_enhancement(job: Job, deadline: float) -> EnhancementResult:
+        try:
+            await asyncio.wait_for(job.leased.wait(), timeout=min(
+                resolved.queue_seconds, max(0, deadline - time.monotonic()),
+            ))
+            remaining = min(
+                max(0, (job.lease_deadline or 0) - time.monotonic()),
+                max(0, deadline - time.monotonic()),
+            )
+            result = await asyncio.wait_for(asyncio.shield(job.result), timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                503, "No matching WebGPU volunteer completed enhancement in time. Originals are unchanged; try again later.",
+            ) from exc
+        if not isinstance(result, EnhancementResult):
+            raise HTTPException(503, "The WebGPU volunteer could not enhance this pair. Originals are unchanged.")
+        return result
+
+    async def owner_disconnect(request: Request) -> None:
+        while True:
+            if (await request.receive())["type"] == "http.disconnect":
+                return
+
+    @service.post("/v1/enhance")
+    async def enhance(request: Request) -> Response:
+        if request.headers.get("x-babel-local-engine") != "1":
+            raise HTTPException(403, "local proxy header is required")
+        token = _access_token(request)
+        if len(token) != 43:
+            raise HTTPException(401, "enhancement requires a 32-byte owner bearer capability")
+        request_id = request.headers.get("x-babel-request-id", "")
+        try:
+            if str(uuid.UUID(request_id)) != request_id:
+                raise ValueError("noncanonical UUID")
+        except ValueError as exc:
+            raise HTTPException(400, "enhancement requires a UUID X-Babel-Request-Id") from exc
+        if not request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
+            raise HTTPException(415, "enhancement requires multipart originals")
+        _check_length(request, resolved.max_request_bytes)
+        if state.inflight >= resolved.max_inflight_requests:
+            raise HTTPException(429, "too many in-flight requests", headers={"Retry-After": "5"})
+        state.inflight += 1
+        temporary = None
+        job = None
+        cleaned = False
+        response_owns_cleanup = False
+
+        async def cleanup(completed: bool = False) -> None:
+            nonlocal cleaned
+            if cleaned:
+                return
+            cleaned = True
+            try:
+                if job is not None and state.jobs.get(job.job_id) is job:
+                    state.fail(job)
+                    state.finish(job, completed=completed)
+                if job is not None and job.io_task is not None:
+                    # A stalled volunteer upload/download must not hold cancelled
+                    # owner admission or temporary audio indefinitely.
+                    job.io_task.cancel()
+                if temporary is not None:
+                    if job is None:
+                        temporary.cleanup()
+                    else:
+                        async with job.io_lock:
+                            temporary.cleanup()
+            finally:
+                state.inflight -= 1
+
+        deadline = time.monotonic() + resolved.request_timeout_seconds
+        async def prepare_response() -> Response:
+            nonlocal temporary, job
+            temporary = tempfile.TemporaryDirectory(prefix="babel-enhancement-")
+            form = await read_enhancement_multipart(request)
+            try:
+                payload, files = parse_enhancement_multipart(form, EnhancementPayload)
+                paths = {}
+                for index, track in enumerate(payload.tracks):
+                    path = Path(temporary.name) / f"original-{index}.wav"
+                    await copy_enhancement_audio(
+                        files[track.fieldName], path, track,
+                        max_bytes=resolved.max_track_bytes, max_seconds=resolved.max_audio_seconds,
+                    )
+                    paths[track.fieldName] = path
+                job = Job(
+                    request_id, "enhance", payload, "", paths,
+                    {track.fieldName: f"original-{index}.wav" for index, track in enumerate(payload.tracks)},
+                    {track.fieldName: "audio/wav" for track in payload.tracks},
+                    asyncio.get_running_loop().create_future(),
+                    owner_digest=hashlib.sha256(token.encode()).hexdigest(),
+                )
+            finally:
+                await form.close()
+            state.enqueue(job)
+            waiting = asyncio.create_task(wait_for_enhancement(job, deadline))
+            disconnected = asyncio.create_task(owner_disconnect(request))
+            try:
+                done, _ = await asyncio.wait((waiting, disconnected), return_when=asyncio.FIRST_COMPLETED)
+                if disconnected in done:
+                    raise HTTPException(499, "enhancement owner disconnected")
+                result = await waiting
+            finally:
+                waiting.cancel()
+                disconnected.cancel()
+                await asyncio.gather(waiting, disconnected, return_exceptions=True)
+            return EnhancementResponse(payload, result, job.output_paths, cleanup)
+
+        try:
+            response = await asyncio.wait_for(prepare_response(), timeout=resolved.request_timeout_seconds)
+            response_owns_cleanup = True
+            return response
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(503, "Enhancement request timed out. Originals are unchanged.") from exc
+        finally:
+            if not response_owns_cleanup:
+                await cleanup()
 
     async def run_job(job: Job, deadline: float) -> Response | DraftResponse | TranscriptionResponse:
         state.enqueue(job)
