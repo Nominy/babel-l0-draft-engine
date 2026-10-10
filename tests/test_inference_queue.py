@@ -70,3 +70,26 @@ def test_duplicate_active_or_recent_request_ids_are_rejected() -> None:
     queue.complete(ticket)
     with pytest.raises(DuplicateRequestIdError):
         queue.register("same")
+
+
+def test_progress_is_owned_retained_and_expired_without_invented_counts() -> None:
+    now = 100.0
+    queue = InferenceQueue(completed_ttl_seconds=10, clock=lambda: now)
+    first = queue.register("first")
+    second = queue.register("second")
+    progress = {"phase": "enhancing", "trackId": "original", "trackIndex": 0,
+                "trackCount": 2, "completedChunks": 2, "totalChunks": 5}
+    queue.update_progress(second, progress)
+    assert "progress" not in queue.status("second").as_dict()
+    queue.update_progress(first, progress)
+    progress["completedChunks"] = 3
+    assert queue.status("first").as_dict()["progress"]["completedChunks"] == 2
+    queue.complete(first)
+    queue.update_progress(first, progress)
+    assert queue.status("first").as_dict()["progress"]["completedChunks"] == 2
+    assert "progress" not in queue.status("second").as_dict()
+    now = 111.0
+    assert queue.status("first") is None
+    replacement = queue.register("first")
+    assert "progress" not in queue.status("first").as_dict()
+    queue.abandon(replacement)

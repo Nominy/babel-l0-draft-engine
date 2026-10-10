@@ -20,13 +20,15 @@ class QueueStatus:
     status: QueueStatusName
     position: int
     queued_count: int
+    progress: dict[str, str | int] | None = None
 
-    def as_dict(self) -> dict[str, str | int]:
+    def as_dict(self) -> dict[str, object]:
         return {
             "requestId": self.request_id,
             "status": self.status,
             "position": self.position,
             "queuedCount": self.queued_count,
+            **({"progress": dict(self.progress)} if self.progress is not None else {}),
         }
 
 
@@ -57,6 +59,7 @@ class InferenceQueue:
         self._waiting: deque[QueueTicket] = deque()
         self._active: dict[str, QueueTicket] = {}
         self._completed: OrderedDict[str, float] = OrderedDict()
+        self._progress: dict[str, dict[str, str | int]] = {}
 
     def register(self, request_id: str) -> QueueTicket:
         self._prune_completed()
@@ -76,6 +79,7 @@ class InferenceQueue:
         """Remove a request that has not started inference."""
         if self._active.get(ticket.request_id) is not ticket:
             return
+        self._progress.pop(ticket.request_id, None)
         if self._running is ticket:
             self._active.pop(ticket.request_id, None)
             self._running = None
@@ -98,11 +102,16 @@ class InferenceQueue:
         self._prune_completed()
         self._promote_next()
 
+    def update_progress(self, ticket: QueueTicket, progress: dict[str, str | int]) -> None:
+        """Called on the event loop only, after the owning engine validates a window."""
+        if self._running is ticket and self._active.get(ticket.request_id) is ticket:
+            self._progress[ticket.request_id] = dict(progress)
+
     def status(self, request_id: str) -> QueueStatus | None:
         self._prune_completed()
         queued_count = len(self._waiting)
         if self._running is not None and self._running.request_id == request_id:
-            return QueueStatus(request_id, "running", 0, queued_count)
+            return QueueStatus(request_id, "running", 0, queued_count, self._progress.get(request_id))
         ticket = self._active.get(request_id)
         if ticket is not None:
             for position, waiting_ticket in enumerate(self._waiting, start=1):
@@ -110,7 +119,7 @@ class InferenceQueue:
                     return QueueStatus(request_id, "queued", position, queued_count)
             return None
         if request_id in self._completed:
-            return QueueStatus(request_id, "completed", 0, queued_count)
+            return QueueStatus(request_id, "completed", 0, queued_count, self._progress.get(request_id))
         return None
 
     def _promote_next(self) -> None:
@@ -127,4 +136,5 @@ class InferenceQueue:
             _, expires_at = next(iter(self._completed.items()))
             if expires_at > now and len(self._completed) <= self._max_completed:
                 break
-            self._completed.popitem(last=False)
+            request_id, _ = self._completed.popitem(last=False)
+            self._progress.pop(request_id, None)

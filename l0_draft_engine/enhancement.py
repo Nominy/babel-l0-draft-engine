@@ -15,7 +15,7 @@ import struct
 from typing import Annotated, Literal, TypeVar
 
 from fastapi import HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from starlette.datastructures import FormData, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 from starlette.responses import StreamingResponse
@@ -29,6 +29,12 @@ COPY_BYTES = 1024 * 1024
 PAYLOAD_BYTES = 64 * 1024
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 Identifier = Annotated[str, Field(min_length=1, max_length=256)]
+ClientId = Annotated[
+    str,
+    Field(strict=True, min_length=36, max_length=36,
+          pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"),
+    AfterValidator(str.lower),
+]
 
 
 class EnhancementSchema(BaseModel):
@@ -63,6 +69,7 @@ class EnhancementTrack(TrackIdentity):
 
 class EnhancementPayload(EnhancementSchema):
     taskId: Identifier
+    clientId: ClientId | None = None
     model: EnhancementModel
     tracks: list[EnhancementTrack] = Field(min_length=2, max_length=2)
 

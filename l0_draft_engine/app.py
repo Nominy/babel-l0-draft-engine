@@ -27,6 +27,9 @@ from .browser_engine import BrowserDraftEngine
 from .inference_release import RELEASE_ID, RELEASE_HEADER, RELEASE_HEADERS, upgrade_detail
 from .inference_queue import DuplicateRequestIdError, InferenceQueue
 from .schemas import DraftPayload, DraftResponse, DraftTimingRequest, TranscriptionResponse
+from .enhancement import (
+    EnhancementPayload, EnhancementResponse, copy_audio, parse_multipart, read_multipart,
+)
 
 
 COPY_CHUNK_BYTES = 1024 * 1024
@@ -280,7 +283,7 @@ def create_app(
         return resolved_engine.health()
 
     @service.get("/v1/queue/{request_id}")
-    async def queue_status(request_id: str) -> dict[str, str | int]:
+    async def queue_status(request_id: str) -> dict[str, object]:
         status = inference_queue.status(request_id)
         if status is None:
             raise HTTPException(status_code=404, detail="request ID not found")
@@ -382,6 +385,93 @@ def create_app(
                     raise exc
             finally:
                 admission_gate.release()
+
+    @service.post("/v1/enhance", response_class=EnhancementResponse)
+    async def enhance(request: Request) -> EnhancementResponse:
+        if request.headers.get("x-babel-local-engine") != "1":
+            raise HTTPException(403, "local proxy header is required")
+        if not isinstance(resolved_engine, BrowserDraftEngine):
+            raise HTTPException(503, "enhancement requires the trusted WebGPU runtime")
+        request_id = _request_id(request)
+        content_length = _content_length(request)
+        if content_length is not None and content_length > resolved_settings.max_request_bytes:
+            raise HTTPException(413, "request exceeds size limit")
+        if not admission_gate.try_acquire():
+            raise HTTPException(429, "too many in-flight requests", headers={"Retry-After": "5"})
+        uploads: list[StarletteUploadFile] = []
+        temporary = None
+        handed_off = False
+        cleaned = False
+
+        async def cleanup(_sent: bool = False) -> None:
+            nonlocal cleaned
+            if cleaned:
+                return
+            cleaned = True
+            try:
+                closing = asyncio.create_task(_close_uploads(uploads))
+                try:
+                    await asyncio.shield(closing)
+                except asyncio.CancelledError as exc:
+                    await _finish_cancelled_worker(closing)
+                    raise exc
+            finally:
+                try:
+                    if temporary is not None:
+                        temporary.cleanup()
+                finally:
+                    admission_gate.release()
+
+        try:
+            form = await read_multipart(request)
+            uploads = [value for _, value in form.multi_items() if isinstance(value, StarletteUploadFile)]
+            payload, files = parse_multipart(form, EnhancementPayload)
+            temporary = tempfile.TemporaryDirectory(prefix="babel-enhancement-")
+            directory = Path(temporary.name)
+            paths, outputs = {}, {}
+            for index, track in enumerate(payload.tracks):
+                path = directory / f"original-{index}.wav"
+                await copy_audio(files[track.fieldName], path, track,
+                                 max_bytes=resolved_settings.max_track_bytes,
+                                 max_seconds=resolved_settings.max_audio_seconds)
+                paths[track.fieldName] = path
+                outputs[track.fieldName] = directory / f"enhanced-{index}.wav"
+            try:
+                ticket = inference_queue.register(request_id)
+            except DuplicateRequestIdError as exc:
+                raise HTTPException(409, "request ID is already registered") from exc
+            try:
+                await ticket.ready.wait()
+            except BaseException:
+                inference_queue.abandon(ticket)
+                raise
+            loop = asyncio.get_running_loop()
+            try:
+                worker = asyncio.create_task(run_in_threadpool(
+                    resolved_engine.enhance, payload, paths, outputs,
+                    lambda update: loop.call_soon_threadsafe(inference_queue.update_progress, ticket, update),
+                ))
+            except BaseException:
+                inference_queue.abandon(ticket)
+                raise
+            try:
+                try:
+                    result = await asyncio.shield(worker)
+                except asyncio.CancelledError as exc:
+                    await _finish_cancelled_worker(worker)
+                    raise exc
+            except DraftInputError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            except ModelUnavailableError as exc:
+                raise HTTPException(503, str(exc)) from exc
+            finally:
+                inference_queue.complete(ticket)
+            response = EnhancementResponse(payload, result, outputs, cleanup)
+            handed_off = True
+            return response
+        finally:
+            if not handed_off:
+                await cleanup()
 
     @service.post("/v1/draft", response_model=DraftResponse)
     async def draft(request: Request, body: DraftTimingRequest) -> DraftResponse:

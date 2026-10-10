@@ -1,11 +1,11 @@
-"""Lightweight public coordinator for browser volunteers and trusted engine failover.
+"""Lightweight public coordinator: official inference before GPU volunteer fallback.
 
 Run with ``uvicorn l0_draft_engine.coordinator:app`` after installing
 ``requirements-coordinator.txt``. Keep one uvicorn process: leases and status
 are deliberately in-memory and cannot be shared between processes.
-Enhancement uses this same worker registry, but never trusted ASR fallback or the
-timing cache. Its owner capability protects status and its temporary WAV pair is
-retained only until the multipart response completes or the owner disconnects.
+Enhancement verifies official GPU capability before dispatch, then uses the same
+worker registry without the timing cache. Its owner capability protects status;
+temporary WAVs survive only until response completion or owner disconnection.
 """
 
 from __future__ import annotations
@@ -40,8 +40,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .schemas import DraftOptions, DraftPayload, DraftResponse, TranscriptionResponse
 from .enhancement import (
-    EnhancementModel, EnhancementPayload, EnhancementProgress, EnhancementResponse,
-    EnhancementResult, copy_audio as copy_enhancement_audio,
+    ClientId, EnhancementModel, EnhancementPayload, EnhancementProgress, EnhancementResponse,
+    EnhancementResult, PAYLOAD_BYTES, copy_audio as copy_enhancement_audio,
     parse_multipart as parse_enhancement_multipart, read_multipart as read_enhancement_multipart,
 )
 from .inference_release import RELEASE_ID, RELEASE, RELEASE_HEADERS, RELEASE_HEADER, validate_punctuated_timing, upgrade_detail
@@ -56,6 +56,7 @@ CHUNK_BYTES = 1024 * 1024
 WORKER_BODY_BYTES = 16 * 1024 * 1024
 DEFAULT_LEASE_BYTES = 64 * 1024
 ACCESS_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
+RECENT_WORKER_POLL_SECONDS = 3.0
 
 
 def _positive_env(name: str, default: int) -> int:
@@ -100,7 +101,7 @@ class CoordinatorSettings:
                self.request_timeout_seconds) <= 0:
             raise ValueError("coordinator timeouts must be positive")
         if self.queue_seconds + self.lease_seconds >= self.request_timeout_seconds:
-            raise ValueError("volunteer wait must leave time for trusted fallback")
+            raise ValueError("request timeout must leave time for official inference and swarm fallback")
         if not 0 < self.cache_max_bytes <= 4 * 1024**3:
             raise ValueError("cache_max_bytes must be between 1 byte and 4 GiB")
 
@@ -276,6 +277,7 @@ class RegisterBody(BaseModel):
     modelBundleSchema: Literal["babel-browser-model-bundle-v3"]
     protocolVersion: Literal[3]
     modelRelease: str
+    clientId: ClientId | None = None
     maxLeaseBytes: int = Field(default=DEFAULT_LEASE_BYTES, ge=DEFAULT_LEASE_BYTES,
                                le=WORKER_BODY_BYTES, strict=True)
     operations: list[Literal["transcribe", "draft", "enhance"]] = Field(
@@ -447,10 +449,16 @@ class Worker:
     operations: tuple[str, ...] = ("transcribe", "draft")
     enhancement_model: EnhancementModel | None = None
     max_lease_bytes: int = DEFAULT_LEASE_BYTES
+    client_id: str | None = None
+    last_poll: float | None = None
+    throughput: dict[str, float] = field(default_factory=dict)
 
     def accepts(self, job: Job) -> bool:
         return job.operation in self.operations and (
-            job.operation != "enhance" or self.enhancement_model == job.payload.model
+            job.operation != "enhance" or (
+                self.enhancement_model == job.payload.model
+                and (not self.client_id or self.client_id != job.payload.clientId)
+            )
         ) and job.lease_response_bytes <= self.max_lease_bytes
 
 
@@ -471,6 +479,7 @@ class Job:
     worker_id: str | None = None
     lease_token: str | None = None
     lease_deadline: float | None = None
+    lease_started: float | None = None
     backend_url: str | None = None
     phase: Literal["queued", "running"] = "queued"
     owner_digest: str | None = None
@@ -502,6 +511,18 @@ class Job:
         # including options/envelope, before assigning a worker that must read it.
         return len(JSONResponse(self.lease_payload("")).body) + 43
 
+    @cached_property
+    def work_units(self) -> float:
+        if self.operation == "draft":
+            return float(sum(len(track.tokens) for track in self.timing.tracks)) if self.timing else 0.0
+        if self.operation == "enhance":
+            return sum(track.frameCount / track.sampleRate for track in self.payload.tracks)
+        seconds = 0.0
+        for path in self.paths.values():
+            with wave.open(str(path), "rb") as audio:
+                seconds += audio.getnframes() / audio.getframerate()
+        return seconds
+
 
 class Coordinator:
     def __init__(self, settings: CoordinatorSettings, client: httpx.AsyncClient) -> None:
@@ -515,6 +536,7 @@ class Coordinator:
         self.waiting: deque[str] = deque()
         self.completed: OrderedDict[str, tuple[float, str | None]] = OrderedDict()
         self.inflight = 0
+        self.backend_throughput: dict[str, dict[str, float]] = {}
 
     def prune(self) -> None:
         now = time.monotonic()
@@ -540,16 +562,57 @@ class Coordinator:
         )
         return idle > waiting
 
+    def prefers_other_worker(self, worker: Worker, job: Job, now: float) -> bool:
+        current = worker.throughput.get(job.operation, 0.0)
+        return any(
+            candidate is not worker
+            and candidate.job_id is None
+            and candidate.last_poll is not None
+            and now - candidate.last_poll <= RECENT_WORKER_POLL_SECONDS
+            and candidate.throughput.get(job.operation, 0.0) > current
+            and candidate.accepts(job)
+            for candidate in self.workers.values()
+        )
+
+    @staticmethod
+    def record_throughput(scores: dict[str, float], job: Job, elapsed: float) -> None:
+        if elapsed <= 0 or job.work_units <= 0:
+            return
+        rate = job.work_units / elapsed
+        if not math.isfinite(rate):
+            return
+        previous = scores.get(job.operation)
+        scores[job.operation] = rate if previous is None else 0.75 * previous + 0.25 * rate
+
+    def record_worker_success(self, job: Job) -> None:
+        worker = self.workers.get(job.worker_id or "")
+        if worker is not None and job.lease_started is not None:
+            self.record_throughput(worker.throughput, job, time.monotonic() - job.lease_started)
+
+    def ordered_backends(self, operation: str, urls: tuple[str, ...]) -> list[str]:
+        return sorted(urls, key=lambda base: self.backend_throughput.get(base, {}).get(operation, 0.0),
+                      reverse=True)
+
+    def official_deadline(self, owner_deadline: float) -> float:
+        remaining = max(0.0, owner_deadline - time.monotonic())
+        reserve = min(self.settings.queue_seconds + self.settings.lease_seconds, remaining / 2)
+        return owner_deadline - reserve
+
+    def record_backend_success(self, job: Job, base: str, elapsed: float) -> None:
+        self.record_throughput(self.backend_throughput.setdefault(base, {}), job, elapsed)
+
     def enqueue(self, job: Job) -> None:
         self.prune()
         if job.request_id in self.by_request_id or job.request_id in self.completed:
             raise HTTPException(409, "request ID is already registered")
         self.jobs[job.job_id] = job
         self.by_request_id[job.request_id] = job
-        if job.operation == "enhance" or self.idle_capacity(job):
-            self.waiting.append(job.job_id)
-        else:
-            job.phase = "running"  # direct backend failover; never queue without a worker
+        job.phase = "running"
+
+    def queue_for_swarm(self, job: Job) -> None:
+        job.backend_url = None
+        job.phase = "queued"
+        self.waiting.append(job.job_id)
 
     def release(self, job: Job) -> None:
         worker = self.workers.get(job.worker_id or "")
@@ -559,6 +622,7 @@ class Coordinator:
         job.worker_id = None
         job.lease_token = None
         job.lease_deadline = None
+        job.lease_started = None
 
     def fail(self, job: Job) -> None:
         self.release(job)
@@ -644,12 +708,14 @@ async def _backend_request(coordinator: Coordinator, job: Job, deadline: float) 
     if job.operation == "enhance":
         raise HTTPException(503, "enhancement requires a matching WebGPU volunteer; Originals are unchanged")
     last_failure: httpx.Response | None = None
-    for base in coordinator.settings.backend_urls:
-        remaining = deadline - time.monotonic()
+    backends = coordinator.ordered_backends(job.operation, coordinator.settings.backend_urls)
+    for index, base in enumerate(backends):
+        remaining = (deadline - time.monotonic()) / (len(backends) - index)
         if remaining <= 0:
             break
         timeout = min(coordinator.settings.backend_timeout_seconds, remaining)
         job.backend_url = base
+        started = time.monotonic()
         try:
             if job.operation == "draft":
                 if job.timing is None:
@@ -664,7 +730,7 @@ async def _backend_request(coordinator: Coordinator, job: Job, deadline: float) 
                         headers={**RELEASE_HEADERS, "X-Babel-Local-Engine": "1", "X-Babel-Request-Id": job.request_id},
                         timeout=httpx.Timeout(timeout, connect=min(5.0, timeout)),
                     ),
-                    timeout=remaining,
+                    timeout=timeout,
                 )
             else:
                 with ExitStack() as streams:
@@ -684,13 +750,20 @@ async def _backend_request(coordinator: Coordinator, job: Job, deadline: float) 
                             headers={**RELEASE_HEADERS, "X-Babel-Local-Engine": "1", "X-Babel-Request-Id": job.request_id},
                             timeout=httpx.Timeout(timeout, connect=min(5.0, timeout)),
                         ),
-                        timeout=remaining,
+                        timeout=timeout,
                     )
         except (httpx.TransportError, asyncio.TimeoutError):
             continue
-        if upstream.status_code in (502, 503, 504):
+        if upstream.status_code >= 500 or upstream.status_code in (408, 429):
             last_failure = upstream
             continue
+        if upstream.status_code == 200:
+            try:
+                _validated_result(job, upstream.json(), coordinator.settings.require_current_release)
+            except (ValueError, ValidationError, TypeError):
+                last_failure = httpx.Response(502, json={"detail": "trusted inference result is invalid"})
+                continue
+            coordinator.record_backend_success(job, base, time.monotonic() - started)
         headers = {}
         if "retry-after" in upstream.headers:
             headers["Retry-After"] = upstream.headers["retry-after"]
@@ -700,6 +773,148 @@ async def _backend_request(coordinator: Coordinator, job: Job, deadline: float) 
         return Response(last_failure.content, status_code=last_failure.status_code,
                         media_type=last_failure.headers.get("content-type"))
     raise HTTPException(503, "trusted inference backends are unavailable")
+
+async def _receive_official_enhancement(
+    response: httpx.Response, job: Job, settings: CoordinatorSettings
+) -> EnhancementResult:
+    payload = job.payload
+    if not isinstance(payload, EnhancementPayload):
+        raise ValueError("official enhancement requires enhancement input")
+    content_type = response.headers.get("content-type", "")
+    if not re.match(r"^multipart/form-data(?:;|$)", content_type, re.IGNORECASE):
+        raise ValueError("official enhancement did not return multipart audio")
+    maximum = sum(44 + track.frameCount * 2 for track in payload.tracks) + PAYLOAD_BYTES
+    declared = response.headers.get("content-length")
+    if declared is not None and (not declared.isdigit() or int(declared) > maximum):
+        raise ValueError("official enhancement response exceeds the pair size")
+    stream = response.aiter_bytes(CHUNK_BYTES).__aiter__()
+    received = 0
+
+    async def receive() -> Message:
+        nonlocal received
+        try:
+            chunk = await anext(stream)
+        except StopAsyncIteration:
+            if declared is not None and received != int(declared):
+                raise ValueError("official enhancement response length mismatch")
+            return {"type": "http.request", "body": b"", "more_body": False}
+        received += len(chunk)
+        if received > maximum:
+            raise ValueError("official enhancement response exceeds the pair size")
+        return {"type": "http.request", "body": chunk, "more_body": True}
+
+    incoming = Request({"type": "http", "method": "POST", "path": "/",
+                        "headers": [(b"content-type", content_type.encode("latin-1"))]}, receive)
+    form = await read_enhancement_multipart(incoming)
+    try:
+        items = list(form.multi_items())
+        fields = dict(items)
+        if len(items) != 3 or set(fields) != {"result", "audio:1", "audio:2"}:
+            raise ValueError("official enhancement returned unexpected or duplicate fields")
+        text = fields["result"]
+        if not isinstance(text, str) or len(text.encode("utf-8")) > PAYLOAD_BYTES:
+            raise ValueError("official enhancement metadata exceeds its bound")
+        report = json.loads(text)
+        if (not isinstance(report, dict)
+                or set(report) != {"ok", "provider", "taskId", "model", "modelSha256", "tracks"}
+                or report["ok"] is not True or report["provider"] != "swarm"
+                or report["taskId"] != payload.taskId):
+            raise ValueError("official enhancement returned a different owner request")
+        result = EnhancementResult.model_validate({
+            key: report[key] for key in ("model", "modelSha256", "tracks")
+        })
+        result.validate_request(payload)
+        parent = next(iter(job.paths.values())).parent
+        with tempfile.TemporaryDirectory(prefix="official-", dir=parent) as temporary:
+            paths: dict[str, Path] = {}
+            for index, (track, metadata) in enumerate(zip(payload.tracks, result.tracks, strict=True)):
+                upload = fields[track.fieldName]
+                if not isinstance(upload, UploadFile):
+                    raise ValueError("official enhancement omitted binary audio")
+                path = Path(temporary) / f"enhanced-{index}.wav"
+                await copy_enhancement_audio(
+                    upload, path, metadata, max_bytes=settings.max_track_bytes,
+                    max_seconds=settings.max_audio_seconds, output=True,
+                )
+                paths[track.fieldName] = path
+            # Publish paths only after every returned identity, digest and clock validates.
+            completed = {}
+            for index, (name, path) in enumerate(paths.items()):
+                target = parent / f"enhanced-{index}.wav"
+                path.replace(target)
+                completed[name] = target
+            job.output_paths = completed
+        return result
+    finally:
+        await form.close()
+
+
+async def _official_enhancement_request(
+    coordinator: Coordinator, job: Job, deadline: float
+) -> EnhancementResult | None:
+    if not isinstance(job.payload, EnhancementPayload):
+        raise ValueError("official enhancement requires enhancement input")
+    backends = coordinator.ordered_backends("enhance", coordinator.settings.backend_urls)
+    for index, base in enumerate(backends):
+        now = time.monotonic()
+        remaining = min(coordinator.settings.backend_timeout_seconds,
+                        (deadline - now) / (len(backends) - index))
+        attempt_deadline = now + remaining
+        if remaining <= 0:
+            break
+        try:
+            # Older official ASR-only services are not enhancement-capable. Do not
+            # upload recordings until the exact GPU model is advertised as ready.
+            health = await asyncio.wait_for(
+                coordinator.client.get(f"{base}/health", headers=RELEASE_HEADERS, timeout=min(5.0, remaining)),
+                timeout=min(5.0, remaining),
+            )
+            if not health.is_success:
+                continue
+            report = health.json()
+            capability = report.get("enhancement") if isinstance(report, dict) else None
+            if (not isinstance(report, dict) or report.get("ok") is not True
+                    or report.get("release") != RELEASE_ID or not isinstance(capability, dict)
+                    or capability.get("provider") != "webgpu"
+                    or any(capability.get(key) != value for key, value in job.payload.model.model_dump().items())):
+                continue
+        except (httpx.TransportError, asyncio.TimeoutError, ValueError):
+            continue
+        remaining = attempt_deadline - time.monotonic()
+        if remaining <= 0:
+            continue
+        job.backend_url = base
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(remaining):
+                with ExitStack() as streams:
+                    files = {
+                        track.fieldName: (job.filenames[track.fieldName],
+                                          streams.enter_context(job.paths[track.fieldName].open("rb")), "audio/wav")
+                        for track in job.payload.tracks
+                    }
+                    async with coordinator.client.stream(
+                        "POST", f"{base}/v1/enhance", files=files,
+                        data={"payload": job.payload.model_dump_json(exclude_none=True)},
+                        headers={**RELEASE_HEADERS, "X-Babel-Local-Engine": "1",
+                                 "X-Babel-Request-Id": job.request_id},
+                        timeout=httpx.Timeout(min(coordinator.settings.backend_timeout_seconds, remaining),
+                                              connect=min(5.0, remaining)),
+                    ) as response:
+                        if response.status_code >= 500 or response.status_code in (404, 408, 409, 426, 429):
+                            continue
+                        if response.status_code != 200:
+                            raise HTTPException(response.status_code, "Official enhancement rejected the request.")
+                        try:
+                            result = await _receive_official_enhancement(response, job, coordinator.settings)
+                        except (HTTPException, ValueError, TypeError, ValidationError):
+                            continue
+                        coordinator.record_backend_success(job, base, time.monotonic() - started)
+                        return result
+        except (httpx.TransportError, asyncio.TimeoutError):
+            continue
+    job.backend_url = None
+    return None
 
 
 def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncClient | None = None) -> FastAPI:
@@ -795,6 +1010,7 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
             token, time.monotonic(), operations=tuple(body.operations),
             enhancement_model=body.enhancementModel,
             max_lease_bytes=body.maxLeaseBytes,
+            client_id=body.clientId,
         )
         return {"workerId": worker_id, "token": token}
 
@@ -802,6 +1018,7 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
     async def lease(body: WorkerBody) -> Response | dict[str, object]:
         worker = state.authenticate(body.workerId, body.token)
         worker.last_seen = time.monotonic()
+        worker.last_poll = worker.last_seen
         if worker.job_id is not None:
             return Response(status_code=204)
         for job_id in tuple(state.waiting):
@@ -809,13 +1026,14 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
             if job is None or job.result.done():
                 state.waiting.remove(job_id)
                 continue
-            if not worker.accepts(job):
+            if not worker.accepts(job) or state.prefers_other_worker(worker, job, worker.last_seen):
                 continue
             state.waiting.remove(job_id)
             worker.job_id = job.job_id
             job.worker_id = body.workerId
             job.lease_token = secrets.token_urlsafe(32)
             job.lease_deadline = time.monotonic() + resolved.lease_seconds
+            job.lease_started = time.monotonic()
             job.phase = "running"
             job.leased.set()
             return JSONResponse(job.lease_payload(job.lease_token))
@@ -915,6 +1133,7 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
                             job.output_paths[track.fieldName] = path
                         # The owner may have disconnected or the lease expired during upload.
                         worker_job(job_id, body, body.leaseToken)
+                        state.record_worker_success(job)
                         state.release(job)
                         job.result.set_result(body.result)
                     finally:
@@ -949,6 +1168,7 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
         except (ValidationError, ValueError) as exc:
             state.fail(job)
             raise HTTPException(422, "worker result does not match the request") from exc
+        state.record_worker_success(job)
         state.release(job)
         if not job.result.done():
             job.result.set_result(result)
@@ -971,6 +1191,13 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
         if not isinstance(result, EnhancementResult):
             raise HTTPException(503, "The WebGPU volunteer could not enhance this pair. Originals are unchanged.")
         return result
+
+    async def run_enhancement(job: Job, deadline: float) -> EnhancementResult:
+        result = await _official_enhancement_request(state, job, state.official_deadline(deadline))
+        if result is not None:
+            return result
+        state.queue_for_swarm(job)
+        return await wait_for_enhancement(job, deadline)
 
     async def owner_disconnect(request: Request) -> None:
         while True:
@@ -1048,7 +1275,7 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
             finally:
                 await form.close()
             state.enqueue(job)
-            waiting = asyncio.create_task(wait_for_enhancement(job, deadline))
+            waiting = asyncio.create_task(run_enhancement(job, deadline))
             disconnected = asyncio.create_task(owner_disconnect(request))
             try:
                 done, _ = await asyncio.wait((waiting, disconnected), return_when=asyncio.FIRST_COMPLETED)
@@ -1075,7 +1302,25 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
         state.enqueue(job)
         responded = False
         try:
-            if job.phase == "queued":
+            try:
+                response = await _backend_request(state, job, state.official_deadline(deadline))
+            except HTTPException as exc:
+                if exc.status_code != 503:
+                    raise
+                response = JSONResponse({"detail": exc.detail}, status_code=503)
+            if response.status_code == 200:
+                try:
+                    result = _validated_result(job, json.loads(response.body), resolved.require_current_release)
+                except (ValueError, ValidationError, TypeError):
+                    response = JSONResponse({"detail": "trusted inference result is invalid"}, status_code=502)
+                else:
+                    responded = True
+                    return result
+            elif response.status_code < 500 and response.status_code not in (408, 429):
+                responded = True
+                return response
+            if state.idle_capacity(job):
+                state.queue_for_swarm(job)
                 try:
                     await asyncio.wait_for(job.leased.wait(), timeout=min(
                         resolved.queue_seconds, max(0, deadline - time.monotonic())
@@ -1090,22 +1335,8 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
                 if result is not None:
                     responded = True
                     return result
-            state.release(job)
-            try:
-                state.waiting.remove(job.job_id)
-            except ValueError:
-                pass
-            job.phase = "running"
-            response = await _backend_request(state, job, deadline)
-            if response.status_code != 200:
-                responded = True
-                return response
-            try:
-                result = _validated_result(job, json.loads(response.body), resolved.require_current_release)
-            except (ValueError, ValidationError, TypeError) as exc:
-                raise HTTPException(502, "trusted inference result is invalid") from exc
             responded = True
-            return result
+            return response
         finally:
             state.finish(job, completed=responded)
 

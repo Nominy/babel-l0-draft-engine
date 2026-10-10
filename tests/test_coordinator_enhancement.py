@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import struct
 import time
+from types import SimpleNamespace
 import uuid
 
 import httpx
@@ -24,6 +25,8 @@ from l0_draft_engine.inference_release import RELEASE_HEADERS, RELEASE_ID
 OWNER = "a" * 43
 OTHER_OWNER = "b" * 43
 MODEL = {"id": MODEL_ID, "sha256": "1" * 64, "sourceGraphSha256": SOURCE_GRAPH_SHA256}
+CLIENT_ID = "abcdef01-2345-4678-9abc-def012345678"
+OTHER_CLIENT_ID = "12345678-1234-4567-89ab-123456789abc"
 
 
 @pytest.fixture
@@ -80,7 +83,9 @@ def settings(tmp_path: Path, **changes) -> CoordinatorSettings:
 @asynccontextmanager
 async def environment(tmp_path: Path, **changes):
     def forbidden_backend(request: httpx.Request) -> httpx.Response:
-        raise AssertionError(f"enhancement must never reach ASR backend: {request.url}")
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"ok": True, "release": RELEASE_ID})
+        raise AssertionError(f"enhancement audio must not reach an ASR-only backend: {request.url}")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(forbidden_backend)) as upstream:
         app = create_app(settings(tmp_path, **changes), client=upstream)
@@ -88,8 +93,11 @@ async def environment(tmp_path: Path, **changes):
             yield app, client
 
 
-async def register(client: httpx.AsyncClient, *, model: dict | None = MODEL, operations=None) -> dict:
+async def register(client: httpx.AsyncClient, *, model: dict | None = MODEL, operations=None,
+                   client_id: str | None = None) -> dict:
     body = {"modelBundleSchema": "babel-browser-model-bundle-v3", "modelRelease": RELEASE_ID, "protocolVersion": 3}
+    if client_id is not None:
+        body["clientId"] = client_id
     if model is not None:
         body.update(enhancementModel=model, operations=operations or ["enhance"])
     elif operations is not None:
@@ -108,13 +116,13 @@ async def submit(client: httpx.AsyncClient, request_id: str, body: dict | None =
 async def admitted(app, client, *, body=None, originals=None):
     request_id = str(uuid.uuid4())
     event = asyncio.Event()
-    enqueue = app.state.coordinator.enqueue
+    enqueue = app.state.coordinator.queue_for_swarm
 
     def notify(job):
         enqueue(job)
         event.set()
 
-    app.state.coordinator.enqueue = notify
+    app.state.coordinator.queue_for_swarm = notify
     pending = asyncio.create_task(submit(client, request_id, body, originals))
     try:
         await asyncio.wait_for(event.wait(), timeout=3)
@@ -123,7 +131,7 @@ async def admitted(app, client, *, body=None, originals=None):
         await asyncio.gather(pending, return_exceptions=True)
         raise
     finally:
-        app.state.coordinator.enqueue = enqueue
+        app.state.coordinator.queue_for_swarm = enqueue
     return request_id, pending, app.state.coordinator.by_request_id[request_id]
 
 
@@ -192,6 +200,136 @@ async def test_round_trip_preserves_originals_and_protects_completed_status(tmp_
         assert (await complete(client, worker, leased, body)).status_code == 404
         assert_clean(app, job)
 
+def official_response(body, outputs=None, *, wrong_task=False):
+    outputs = outputs or (wav(), wav())
+    boundary = "official-enhancement-proof"
+    metadata = {"ok": True, "provider": "swarm",
+                "taskId": "other-task" if wrong_task else body["taskId"], **result(body, outputs)}
+    parts = [(f"--{boundary}\r\nContent-Disposition: form-data; name=\"result\"\r\n\r\n".encode()
+              + json.dumps(metadata).encode() + b"\r\n")]
+    for index, audio in enumerate(outputs, 1):
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"audio:{index}\"; filename=\"{index}.wav\"\r\nContent-Type: audio/wav\r\n\r\n".encode()
+                     + audio + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    return httpx.Response(200, content=b"".join(parts),
+                          headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+
+
+@pytest.mark.anyio
+async def test_official_enhancement_has_priority_over_idle_swarm_and_cleans_outputs(tmp_path, monkeypatch):
+    clock = [time.monotonic()]
+    monkeypatch.setattr(coordinator_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    entered, finish = asyncio.Event(), asyncio.Event()
+    body = payload()
+    changed = bytearray(wav())
+    changed[-2:] = b"\x00\x08"
+    outputs = (bytes(changed), wav())
+
+    async def backend(request):
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"ok": True, "release": RELEASE_ID,
+                                             "enhancement": {**MODEL, "provider": "webgpu"}})
+        assert request.url.path == "/v1/enhance"
+        entered.set()
+        await finish.wait()
+        clock[0] += 1.0
+        return official_response(body, outputs)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(backend)) as upstream:
+        app = create_app(settings(tmp_path), client=upstream)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://coordinator") as client:
+            worker = await register(client)
+            request_id = str(uuid.uuid4())
+            pending = asyncio.create_task(submit(client, request_id, body))
+            try:
+                await asyncio.wait_for(entered.wait(), 3)
+                job = app.state.coordinator.by_request_id[request_id]
+                assert not app.state.coordinator.waiting
+                assert (await client.post("/v1/workers/lease", json=worker)).status_code == 204
+                assert job.backend_url == "http://asr-only"
+                finish.set()
+                response = await asyncio.wait_for(pending, 3)
+                assert response.status_code == 200
+                parts = multipart_result(response)
+                assert parts["audio:1"] == outputs[0] != wav()
+                assert app.state.coordinator.backend_throughput["http://asr-only"]["enhance"] > 0
+                assert_clean(app, job)
+            finally:
+                finish.set()
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure", ["unavailable", "wrong-model", "wrong-task", "corrupt-wave", "stall"])
+async def test_official_failure_enables_swarm_only_after_validation_fails(tmp_path, failure):
+    calls = []
+    body = payload()
+
+    async def backend(request):
+        calls.append(request.url.path)
+        if request.url.path == "/health":
+            model = {**MODEL, **({"sha256": "2" * 64} if failure == "wrong-model" else {})}
+            return httpx.Response(200, json={"ok": True, "release": RELEASE_ID,
+                                             "enhancement": {**model, "provider": "webgpu"}})
+        assert request.url.path == "/v1/enhance"
+        if failure == "unavailable":
+            return httpx.Response(503)
+        if failure == "stall":
+            await asyncio.Event().wait()
+        response = official_response(body, wrong_task=failure == "wrong-task")
+        if failure == "corrupt-wave":
+            response = httpx.Response(200, content=response.content.replace(wav(), wav()[:-2] + b"\x00\x09", 1),
+                                      headers={"Content-Type": response.headers["content-type"]})
+        return response
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(backend)) as upstream:
+        app = create_app(settings(tmp_path, queue_seconds=0.2, lease_seconds=0.3,
+                                  request_timeout_seconds=1.2), client=upstream)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://coordinator") as client:
+            worker = await register(client)
+            _, pending, job = await admitted(app, client, body=body)
+            assert calls == (["/health"] if failure == "wrong-model" else ["/health", "/v1/enhance"])
+            assert not app.state.coordinator.backend_throughput
+            leased = await lease(client, worker)
+            assert (await complete(client, worker, leased, body)).status_code == 200
+            assert (await pending).status_code == 200
+            assert_clean(app, job)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stall_phase", ["health", "enhance"])
+async def test_stalled_official_leaves_time_for_next_enhancement_official(tmp_path, stall_phase):
+    body = payload()
+    attempts = []
+    changed = wav()[:-2] + b"\x00\x08"
+
+    async def backend(request):
+        attempts.append((request.url.host, request.url.path))
+        if request.url.host == "stalled" and (
+                stall_phase == "health" or request.url.path == "/v1/enhance"):
+            await asyncio.Event().wait()
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"ok": True, "release": RELEASE_ID,
+                                             "enhancement": {**MODEL, "provider": "webgpu"}})
+        return official_response(body, (changed, changed))
+
+    config = settings(tmp_path, backend_urls=("http://stalled", "http://healthy"),
+                      queue_seconds=0.2, lease_seconds=0.3, request_timeout_seconds=1.2)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(backend)) as upstream:
+        app = create_app(config, client=upstream)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://coordinator") as client:
+            await register(client)
+            response = await submit(client, str(uuid.uuid4()), body)
+            assert response.status_code == 200, response.text
+            parts = multipart_result(response)
+            assert parts["audio:1"] == parts["audio:2"] == changed
+            assert attempts == [
+                ("stalled", "/health"),
+                *([("stalled", "/v1/enhance")] if stall_phase == "enhance" else []),
+                ("healthy", "/health"), ("healthy", "/v1/enhance"),
+            ]
+
 
 @pytest.mark.anyio
 async def test_exact_model_capability_and_busy_matching_worker_receive_queued_jobs(tmp_path):
@@ -213,6 +351,149 @@ async def test_exact_model_capability_and_busy_matching_worker_receive_queued_jo
         assert (await complete(client, matching, second_lease, payload())).status_code == 200
         assert (await second).status_code == 200
         assert_clean(app, second_job)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("worker_client_id", [CLIENT_ID, CLIENT_ID.upper()])
+async def test_own_worker_cannot_lease_enhancement_but_other_matching_worker_can(tmp_path, worker_client_id):
+    async with environment(tmp_path) as (app, client):
+        own = await register(client, client_id=worker_client_id)
+        other = await register(client, client_id=OTHER_CLIENT_ID)
+        body = {**payload(), "clientId": CLIENT_ID}
+        _, pending, job = await admitted(app, client, body=body)
+        assert app.state.coordinator.workers[own["workerId"]].client_id == CLIENT_ID
+        assert (await client.post("/v1/workers/lease", json=own)).status_code == 204
+        assert job.worker_id is None and job.job_id in app.state.coordinator.waiting
+        leased = await lease(client, other)
+        assert leased["jobId"] == job.job_id and leased["payload"] == body
+        assert (await complete(client, other, leased, body)).status_code == 200
+        assert (await pending).status_code == 200
+        assert_clean(app, job)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("worker_client_id,payload_client_id", [
+    (None, None), (CLIENT_ID, None), (None, CLIENT_ID),
+])
+async def test_omitted_client_ids_preserve_enhancement_eligibility(tmp_path, worker_client_id, payload_client_id):
+    async with environment(tmp_path) as (app, client):
+        worker = await register(client, client_id=worker_client_id)
+        body = payload()
+        if payload_client_id is not None:
+            body["clientId"] = payload_client_id
+        _, pending, job = await admitted(app, client, body=body)
+        leased = await lease(client, worker)
+        assert leased["payload"] == body
+        assert (await complete(client, worker, leased, body)).status_code == 200
+        assert (await pending).status_code == 200
+        assert_clean(app, job)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("client_id", [
+    "", "not-a-uuid", CLIENT_ID.replace("-", ""), f" {CLIENT_ID}", f"{CLIENT_ID}\n",
+    CLIENT_ID[:-1] + "g", 123, True, [], {},
+])
+async def test_invalid_client_ids_rejected_for_registration_and_enhancement(tmp_path, client_id):
+    async with environment(tmp_path) as (app, client):
+        response = await client.post("/v1/workers/register", json={
+            "modelBundleSchema": "babel-browser-model-bundle-v3", "protocolVersion": 3,
+            "modelRelease": RELEASE_ID, "clientId": client_id,
+        })
+        assert response.status_code == 422
+        assert not app.state.coordinator.workers
+        response = await submit(client, str(uuid.uuid4()), {**payload(), "clientId": client_id})
+        assert response.status_code == 422
+        assert app.state.coordinator.inflight == 0 and not app.state.coordinator.jobs
+
+
+@pytest.mark.parametrize("operation", ["transcribe", "draft"])
+def test_client_id_does_not_exclude_asr_or_draft(operation):
+    worker = coordinator_module.Worker("token", time.monotonic(), client_id=CLIENT_ID)
+    job = coordinator_module.Job(
+        request_id="request", operation=operation,
+        payload=coordinator_module.DraftPayload.model_validate({
+            "taskId": "task", "tracks": [
+                {"lane": "speaker-1", "fieldName": "audio:1"},
+                {"lane": "speaker-2", "fieldName": "audio:2"},
+            ],
+        }),
+        raw_payload="", paths={}, filenames={}, types={}, result=None,
+    )
+    assert worker.accepts(job)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("candidate_state", [
+    "fast", "stale", "never-polled", "busy", "own-client", "wrong-model", "small-lease",
+    "different-operation", "unknown", "equal",
+])
+async def test_measured_fast_worker_preference_is_compatible_and_bounded(tmp_path, candidate_state):
+    async with environment(tmp_path) as (app, client):
+        current = await register(client)
+        faster = await register(client, client_id=CLIENT_ID if candidate_state == "own-client" else OTHER_CLIENT_ID)
+        assert (await client.post("/v1/workers/lease", json=faster)).status_code == 204
+        body = {**payload(), "clientId": CLIENT_ID}
+        _, pending, job = await admitted(app, client, body=body)
+        state = app.state.coordinator
+        current_worker = state.workers[current["workerId"]]
+        candidate = state.workers[faster["workerId"]]
+        state.record_throughput(current_worker.throughput, job, 2.0)
+        state.record_throughput(candidate.throughput, job, 1.0)
+        if candidate_state == "stale":
+            candidate.last_poll -= coordinator_module.RECENT_WORKER_POLL_SECONDS + 1
+        elif candidate_state == "never-polled":
+            candidate.last_poll = None
+        elif candidate_state == "busy":
+            candidate.job_id = "other-job"
+        elif candidate_state == "wrong-model":
+            candidate.enhancement_model = candidate.enhancement_model.model_copy(update={"sha256": "2" * 64})
+        elif candidate_state == "small-lease":
+            candidate.max_lease_bytes = job.lease_response_bytes - 1
+        elif candidate_state == "different-operation":
+            candidate.throughput = {"transcribe": 100.0}
+        elif candidate_state == "unknown":
+            candidate.throughput.clear()
+            current_worker.throughput.clear()
+        elif candidate_state == "equal":
+            candidate.throughput = dict(current_worker.throughput)
+        selected = current
+        if candidate_state == "fast":
+            assert (await client.post("/v1/workers/lease", json=current)).status_code == 204
+            selected = faster
+        leased = await lease(client, selected)
+        assert (await complete(client, selected, leased, body)).status_code == 200
+        assert (await pending).status_code == 200
+        candidate.job_id = None
+        assert_clean(app, job)
+
+
+@pytest.mark.anyio
+async def test_throughput_ewma_and_official_order_are_per_operation(tmp_path):
+    async with environment(tmp_path) as (app, client):
+        worker = await register(client)
+        _, pending, job = await admitted(app, client)
+        state = app.state.coordinator
+        assert job.work_units == pytest.approx(0.02)
+        scores = {}
+        state.record_throughput(scores, job, 2.0)
+        assert scores == {"enhance": pytest.approx(0.01)}
+        state.record_throughput(scores, job, 1.0)
+        assert scores == {"enhance": pytest.approx(0.0125)}
+        state.record_throughput(scores, job, 0.0)
+        assert scores == {"enhance": pytest.approx(0.0125)}
+        urls = ("http://first", "http://second")
+        assert state.ordered_backends("enhance", urls) == list(urls)
+        state.record_backend_success(job, urls[0], 2.0)
+        state.record_backend_success(job, urls[1], 1.0)
+        assert state.ordered_backends("enhance", urls) == list(reversed(urls))
+        assert state.ordered_backends("transcribe", urls) == list(urls)
+        leased = await lease(client, worker)
+        job.lease_started -= 1.0
+        assert (await complete(client, worker, leased, payload())).status_code == 200
+        assert state.workers[worker["workerId"]].throughput["enhance"] > 0
+        assert (await pending).status_code == 200
+        assert_clean(app, job)
 
 
 @pytest.mark.anyio
@@ -432,11 +713,11 @@ async def test_http_disconnect_revokes_lease_and_removes_originals(tmp_path):
         incoming = asyncio.Queue()
         incoming.put_nowait({"type": "http.request", "body": request.read(), "more_body": False})
         admitted_event = asyncio.Event()
-        enqueue = app.state.coordinator.enqueue
+        enqueue = app.state.coordinator.queue_for_swarm
         def notify(job):
             enqueue(job)
             admitted_event.set()
-        app.state.coordinator.enqueue = notify
+        app.state.coordinator.queue_for_swarm = notify
         sent = []
         async def send(message): sent.append(message)
         pending = asyncio.create_task(app({

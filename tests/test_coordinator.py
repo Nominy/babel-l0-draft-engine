@@ -5,11 +5,14 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import time
+from types import SimpleNamespace
 import wave
 
 import httpx
 import pytest
 
+from l0_draft_engine import coordinator as coordinator_module
 from l0_draft_engine.coordinator import CoordinatorSettings, TimingCache, create_app
 from l0_draft_engine.schemas import TranscriptionResponse
 from l0_draft_engine.inference_release import RELEASE_ID
@@ -191,7 +194,7 @@ async def test_timing_first_inflight_join_arbitrary_worker_and_reload_cache() ->
         changed_audio = wav_bytes()[:-2] + b"\x02\x01"
         assert (await submit(client, "transcribe", "collision", task_id=task_id,
                              first=changed_audio)).status_code == 409
-    assert fallback_calls == []
+    assert fallback_calls == ["/v1/transcribe", "/v1/draft"]
     await upstream.aclose()
 
 @pytest.mark.anyio
@@ -213,8 +216,8 @@ async def test_fresh_large_draft_never_leases_to_an_incapable_worker(large_lease
         if request.url.path.startswith("/v1/queue/"):
             return httpx.Response(404)
         fallback_calls.append(request.url.path)
-        assert request.url.path == "/v1/draft"
-        return httpx.Response(200, json=draft_result())
+        assert request.url.path in ("/v1/transcribe", "/v1/draft")
+        return httpx.Response(503)
 
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(backend))
     app = create_app(settings(queue_seconds=30), client=upstream)
@@ -244,8 +247,11 @@ async def test_fresh_large_draft_never_leases_to_an_incapable_worker(large_lease
                 assert (await client.post(f"/v1/jobs/{leased['jobId']}/complete", json={
                     **worker, "leaseToken": leased["leaseToken"], "result": draft_result(),
                 })).status_code == 200
-            assert (await asyncio.wait_for(pending, timeout=3)).json() == draft_result()
-            assert fallback_calls == ([] if large_lease_capacity else ["/v1/draft"])
+            response = await asyncio.wait_for(pending, timeout=3)
+            assert response.status_code == (200 if large_lease_capacity else 503)
+            if large_lease_capacity:
+                assert response.json() == draft_result()
+            assert fallback_calls == ["/v1/transcribe", "/v1/draft"]
             assert (await client.post("/v1/workers/lease", json=worker)).status_code == 204
             assert not app.state.coordinator.jobs
         finally:
@@ -260,7 +266,7 @@ async def test_capabilities_transcribe_same_task_independently(first_completed: 
     def backend(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path.startswith("/v1/queue/"):
             return httpx.Response(404)
-        raise AssertionError("timing must come from the matching volunteer or private cache")
+        return httpx.Response(503)
 
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(backend))
     app = create_app(settings(), client=upstream)
@@ -330,7 +336,7 @@ async def test_changed_transcription_input_conflicts_inflight_and_cached(change:
     def backend(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path.startswith("/v1/queue/"):
             return httpx.Response(404)
-        raise AssertionError("mismatched input must not dispatch another job")
+        return httpx.Response(503)
 
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(backend))
     app = create_app(settings(), client=upstream)
@@ -397,7 +403,7 @@ async def test_legacy_task_only_cache_is_invalidated_before_retranscription(tmp_
 
 
 @pytest.mark.anyio
-async def test_idle_fallback_preserves_payload_and_backend_queue_status() -> None:
+async def test_official_service_precedes_idle_swarm_and_preserves_backend_queue_status() -> None:
     started = asyncio.Event()
     release = asyncio.Event()
     seen: list[tuple[httpx.Request, bytes]] = []
@@ -417,9 +423,11 @@ async def test_idle_fallback_preserves_payload_and_backend_queue_status() -> Non
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(backend))
     app = create_app(settings(), client=upstream)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://coordinator") as client:
+        worker = await register(client)
         task = asyncio.create_task(submit(client, "transcribe", "fallback", task_id="original-id"))
         await asyncio.wait_for(started.wait(), timeout=2)
         try:
+            assert (await client.post("/v1/workers/lease", json=worker)).status_code == 204
             assert (await client.get("/v1/queue/fallback")).json()["position"] == 2
             health = (await client.get("/health")).json()
             assert health["ok"] is True and health["device"] == "cuda"
@@ -435,6 +443,125 @@ async def test_idle_fallback_preserves_payload_and_backend_queue_status() -> Non
     assert b'"original-id"' in seen[0][1]
     assert wav_bytes() in seen[0][1]
     await upstream.aclose()
+
+
+@pytest.mark.anyio
+async def test_official_draft_precedes_idle_swarm(monkeypatch) -> None:
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = []
+    clock = [time.monotonic()]
+    monkeypatch.setattr(coordinator_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    async def backend(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path == "/v1/transcribe":
+            clock[0] += 1.0
+            return httpx.Response(200, json=timing_result())
+        assert request.url.path == "/v1/draft"
+        started.set()
+        await release.wait()
+        clock[0] += 1.0
+        return httpx.Response(200, json=draft_result())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(backend)) as upstream:
+        app = create_app(settings(), client=upstream)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://coordinator") as client:
+            worker = await register(client)
+            assert (await submit(client, "transcribe", "timing")).status_code == 200
+            pending = asyncio.create_task(draft(client, "official-draft"))
+            await asyncio.wait_for(started.wait(), timeout=2)
+            try:
+                assert (await client.post("/v1/workers/lease", json=worker)).status_code == 204
+                assert not app.state.coordinator.waiting
+            finally:
+                release.set()
+            assert (await pending).json() == draft_result()
+            assert calls == ["/v1/transcribe", "/v1/draft"]
+            scores = app.state.coordinator.backend_throughput["http://trusted"]
+            assert set(scores) == {"transcribe", "draft"}
+            assert all(rate > 0 for rate in scores.values())
+            assert not app.state.coordinator.workers[worker["workerId"]].throughput
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure", ["connect", "invalid-result", "unavailable", "throttled", "request-timeout", "stall"])
+async def test_official_failure_allows_swarm_only_after_attempt(failure: str) -> None:
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def backend(request: httpx.Request) -> httpx.Response:
+        started.set()
+        await release.wait()
+        if failure == "connect":
+            raise httpx.ConnectError("offline")
+        if failure == "invalid-result":
+            return httpx.Response(200, json={"bad": "result"})
+        if failure == "stall":
+            await asyncio.Event().wait()
+        if failure in ("throttled", "request-timeout"):
+            return httpx.Response(429 if failure == "throttled" else 408)
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(backend)) as upstream:
+        app = create_app(settings(queue_seconds=0.2, lease_seconds=0.3, request_timeout_seconds=1.2), client=upstream)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://coordinator") as client:
+            worker = await register(client)
+            pending = asyncio.create_task(submit(client, "transcribe", "official-failure"))
+            await asyncio.wait_for(started.wait(), timeout=2)
+            queued = asyncio.Event()
+            queue_for_swarm = app.state.coordinator.queue_for_swarm
+
+            def notify(job):
+                queue_for_swarm(job)
+                queued.set()
+
+            app.state.coordinator.queue_for_swarm = notify
+            try:
+                assert (await client.post("/v1/workers/lease", json=worker)).status_code == 204
+                release.set()
+                await asyncio.wait_for(queued.wait(), timeout=2)
+                assert not app.state.coordinator.backend_throughput
+                lease_response = await client.post("/v1/workers/lease", json=worker)
+                assert lease_response.status_code == 200
+                leased = lease_response.json()
+                assert (await client.post(f"/v1/jobs/{leased['jobId']}/complete", json={
+                    **worker, "leaseToken": leased["leaseToken"], "result": timing_result(),
+                })).status_code == 200
+                assert (await pending).status_code == 200
+            finally:
+                release.set()
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("operation", ["transcribe", "draft"])
+async def test_stalled_official_leaves_time_for_next_official(operation):
+    attempts = []
+
+    async def backend(request):
+        if operation == "draft" and request.url.path == "/v1/transcribe":
+            return httpx.Response(200, json=timing_result())
+        attempts.append(request.url.host)
+        if request.url.host == "stalled":
+            await asyncio.Event().wait()
+        return httpx.Response(200, json=draft_result() if operation == "draft" else timing_result())
+
+    config = CoordinatorSettings(backend_urls=("http://stalled", "http://healthy"), cache_dir=CACHE_ROOT,
+                                 queue_seconds=0.2, lease_seconds=0.3, request_timeout_seconds=1.2)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(backend)) as upstream:
+        app = create_app(config, client=upstream)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://coordinator") as client:
+            await register(client)
+            if operation == "draft":
+                assert (await submit(client, "transcribe", "prepare-timing")).status_code == 200
+                response = await draft(client, "second-official")
+                expected = draft_result()
+            else:
+                response = await submit(client, "transcribe", "second-official")
+                expected = {**timing_result(), "accessToken": TOKEN}
+            assert response.status_code == 200
+            assert response.json() == expected
+            assert attempts == ["stalled", "healthy"]
 
 
 @pytest.mark.anyio
@@ -497,7 +624,7 @@ async def test_inflight_limit_rejects_concurrent_upload_before_dispatch() -> Non
 
 
 @pytest.mark.anyio
-async def test_invalid_result_and_worker_error_fall_back_without_stranding_lease() -> None:
+async def test_invalid_result_and_worker_error_release_lease_after_official_failure() -> None:
     calls = 0
 
     def backend(request: httpx.Request) -> httpx.Response:
@@ -505,7 +632,7 @@ async def test_invalid_result_and_worker_error_fall_back_without_stranding_lease
         if request.url.path.startswith("/v1/queue/"):
             return httpx.Response(404)
         calls += 1
-        return httpx.Response(200, json=timing_result(request.headers["x-babel-request-id"]))
+        return httpx.Response(503)
 
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(backend))
     app = create_app(settings(), client=upstream)
@@ -526,14 +653,15 @@ async def test_invalid_result_and_worker_error_fall_back_without_stranding_lease
                 **worker, "leaseToken": lease["leaseToken"], **body,
             })
             assert complete.status_code == expected
-            assert (await task).json() == {**timing_result(request_id), "accessToken": TOKEN}
+            assert not app.state.coordinator.workers[worker["workerId"]].throughput
+            assert (await task).status_code == 503
         assert calls == 2
         assert (await client.post("/v1/workers/lease", json=worker)).status_code == 204
     await upstream.aclose()
 
 
 @pytest.mark.anyio
-async def test_lease_expiry_and_cancelled_request_release_audio_and_fall_back() -> None:
+async def test_lease_expiry_and_cancelled_request_release_audio_after_official_failure() -> None:
     calls = 0
 
     def backend(request: httpx.Request) -> httpx.Response:
@@ -541,7 +669,7 @@ async def test_lease_expiry_and_cancelled_request_release_audio_and_fall_back() 
         if request.url.path.startswith("/v1/queue/"):
             return httpx.Response(404)
         calls += 1
-        return httpx.Response(200, json=timing_result("expired"))
+        return httpx.Response(503)
 
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(backend))
     app = create_app(settings(lease_seconds=0.02, queue_seconds=0.1), client=upstream)
@@ -550,7 +678,7 @@ async def test_lease_expiry_and_cancelled_request_release_audio_and_fall_back() 
         task = asyncio.create_task(submit(client, "transcribe", "expired", task_id="expired"))
         await wait_for_status(client, "expired")
         lease = (await client.post("/v1/workers/lease", json=worker)).json()
-        assert (await task).json() == {**timing_result("expired"), "accessToken": TOKEN}
+        assert (await task).status_code == 503
         assert calls == 1
         assert (await client.get(lease["audio"][0]["url"], headers={
             "Authorization": f"Bearer {lease['leaseToken']}"
