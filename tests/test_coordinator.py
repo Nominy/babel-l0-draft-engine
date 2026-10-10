@@ -194,6 +194,65 @@ async def test_timing_first_inflight_join_arbitrary_worker_and_reload_cache() ->
     assert fallback_calls == []
     await upstream.aclose()
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("large_lease_capacity", [False, True])
+async def test_fresh_large_draft_never_leases_to_an_incapable_worker(large_lease_capacity: bool) -> None:
+    timing = timing_result()
+    track = timing["tracks"][0]
+    track["tokens"] = [
+        {"id": f"word-{index}", "text": "слово",
+         "startSeconds": index / 4, "endSeconds": (index + 1) / 4}
+        for index in range(1000)
+    ]
+    track["punctuationLabels"] = [0] * 999 + [2]
+    track["segments"] = [{"id": "long-segment", "startSeconds": 0, "endSeconds": 250,
+                          "startSample": 0, "endSample": 4_000_000, "sampleRate": 16_000}]
+    fallback_calls = []
+
+    def backend(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/v1/queue/"):
+            return httpx.Response(404)
+        fallback_calls.append(request.url.path)
+        assert request.url.path == "/v1/draft"
+        return httpx.Response(200, json=draft_result())
+
+    upstream = httpx.AsyncClient(transport=httpx.MockTransport(backend))
+    app = create_app(settings(queue_seconds=30), client=upstream)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://coordinator") as client:
+        registration = {"modelBundleSchema": "babel-browser-model-bundle-v3",
+                        "modelRelease": RELEASE_ID, "protocolVersion": 3}
+        if large_lease_capacity:
+            registration["maxLeaseBytes"] = 16 * 1024 * 1024
+        registered = await client.post("/v1/workers/register", json=registration)
+        assert registered.status_code == 200
+        worker = registered.json()
+        first = asyncio.create_task(submit(client, "transcribe", "fresh-long"))
+        await wait_for_status(client, "fresh-long")
+        leased = (await client.post("/v1/workers/lease", json=worker)).json()
+        assert (await client.post(f"/v1/jobs/{leased['jobId']}/complete", json={
+            **worker, "leaseToken": leased["leaseToken"], "result": timing,
+        })).status_code == 200
+        assert (await first).status_code == 200
+        pending = asyncio.create_task(draft(client, "fresh-punctuation"))
+        try:
+            if large_lease_capacity:
+                assert (await wait_for_status(client, "fresh-punctuation"))["status"] == "queued"
+                response = await client.post("/v1/workers/lease", json=worker)
+                assert 64 * 1024 < len(response.content) <= registration["maxLeaseBytes"]
+                leased = response.json()
+                assert leased["payload"]["timing"]["tracks"][0]["punctuationLabels"][-1] == 2
+                assert (await client.post(f"/v1/jobs/{leased['jobId']}/complete", json={
+                    **worker, "leaseToken": leased["leaseToken"], "result": draft_result(),
+                })).status_code == 200
+            assert (await asyncio.wait_for(pending, timeout=3)).json() == draft_result()
+            assert fallback_calls == ([] if large_lease_capacity else ["/v1/draft"])
+            assert (await client.post("/v1/workers/lease", json=worker)).status_code == 204
+            assert not app.state.coordinator.jobs
+        finally:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+    await upstream.aclose()
+
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("first_completed", [False, True], ids=["inflight", "cached"])

@@ -15,6 +15,7 @@ import asyncio
 from contextlib import ExitStack, asynccontextmanager
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+from functools import cached_property
 import hashlib
 import json
 import math
@@ -53,6 +54,7 @@ ALLOWED_ORIGIN_RE = (
 )
 CHUNK_BYTES = 1024 * 1024
 WORKER_BODY_BYTES = 16 * 1024 * 1024
+DEFAULT_LEASE_BYTES = 64 * 1024
 ACCESS_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
 
 
@@ -274,6 +276,8 @@ class RegisterBody(BaseModel):
     modelBundleSchema: Literal["babel-browser-model-bundle-v3"]
     protocolVersion: Literal[3]
     modelRelease: str
+    maxLeaseBytes: int = Field(default=DEFAULT_LEASE_BYTES, ge=DEFAULT_LEASE_BYTES,
+                               le=WORKER_BODY_BYTES, strict=True)
     operations: list[Literal["transcribe", "draft", "enhance"]] = Field(
         default_factory=lambda: ["transcribe", "draft"], min_length=1, max_length=3,
     )
@@ -442,11 +446,12 @@ class Worker:
     job_id: str | None = None
     operations: tuple[str, ...] = ("transcribe", "draft")
     enhancement_model: EnhancementModel | None = None
+    max_lease_bytes: int = DEFAULT_LEASE_BYTES
 
     def accepts(self, job: Job) -> bool:
         return job.operation in self.operations and (
             job.operation != "enhance" or self.enhancement_model == job.payload.model
-        )
+        ) and job.lease_response_bytes <= self.max_lease_bytes
 
 
 @dataclass
@@ -473,6 +478,29 @@ class Job:
     output_paths: dict[str, Path] = field(default_factory=dict)
     io_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     io_task: asyncio.Task | None = None
+
+    def lease_payload(self, lease_token: str) -> dict[str, object]:
+        return {
+            "jobId": self.job_id, "leaseToken": lease_token, "operation": self.operation,
+            "payload": (
+                {"taskId": self.payload.taskId,
+                 "timing": self.timing.model_dump(exclude={"accessToken"}),
+                 **({"options": self.options.model_dump(exclude_none=True)} if self.options else {})}
+                if self.operation == "draft" and self.timing is not None
+                else self.payload.model_dump(exclude_none=True)
+            ),
+            "audio": [
+                {"fieldName": track.fieldName,
+                 "url": f"/v1/jobs/{self.job_id}/audio/{quote(track.fieldName, safe='')}"}
+                for track in self.payload.tracks
+            ] if self.operation in ("transcribe", "enhance") else [],
+        }
+
+    @cached_property
+    def lease_response_bytes(self) -> int:
+        # token_urlsafe(32) is 43 ASCII bytes. Use the actual UTF-8 JSON encoding,
+        # including options/envelope, before assigning a worker that must read it.
+        return len(JSONResponse(self.lease_payload("")).body) + 43
 
 
 class Coordinator:
@@ -766,6 +794,7 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
         state.workers[worker_id] = Worker(
             token, time.monotonic(), operations=tuple(body.operations),
             enhancement_model=body.enhancementModel,
+            max_lease_bytes=body.maxLeaseBytes,
         )
         return {"workerId": worker_id, "token": token}
 
@@ -789,22 +818,7 @@ def create_app(settings: CoordinatorSettings | None = None, client: httpx.AsyncC
             job.lease_deadline = time.monotonic() + resolved.lease_seconds
             job.phase = "running"
             job.leased.set()
-            return {
-                "jobId": job.job_id, "leaseToken": job.lease_token,
-                "operation": job.operation,
-                "payload": (
-                    {"taskId": job.payload.taskId,
-                     "timing": job.timing.model_dump(exclude={"accessToken"}),
-                     **({"options": job.options.model_dump(exclude_none=True)} if job.options else {})}
-                    if job.operation == "draft" and job.timing is not None
-                    else job.payload.model_dump(exclude_none=True)
-                ),
-                "audio": [
-                    {"fieldName": track.fieldName,
-                     "url": f"/v1/jobs/{job.job_id}/audio/{quote(track.fieldName, safe='')}"}
-                    for track in job.payload.tracks
-                ] if job.operation in ("transcribe", "enhance") else [],
-            }
+            return JSONResponse(job.lease_payload(job.lease_token))
         return Response(status_code=204)
 
     def authorized_job(job_id: str, lease_token: str) -> Job:
