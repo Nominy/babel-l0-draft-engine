@@ -16,12 +16,13 @@ The finite owner deadline reserves up to the configured swarm queue-plus-lease d
 
 | Deployment | Supervision | Local / public-loopback port | State |
 |---|---|---|---|
+| Windows combined L0 + ZipEnhancer 0.2.51 | `Babel Official GPU Engine 0.2.51`, `Babel Official GPU Reviewgen Tunnel 0.2.51` | 8773 / 28773 | Verified inference with protocol-compatible local recovery progress |
 | Windows combined L0 + ZipEnhancer 0.2.50 | `Babel Official GPU Engine 0.2.50`, `Babel Official GPU Reviewgen Tunnel 0.2.50` | 8772 / 28772 | Verified public HTTP inference with packaged full-FP32 numerical recovery |
 | Previous combined 0.2.49 service | `Babel Official GPU Engine`, `Babel Official GPU Reviewgen Tunnel` | 8771 / 28771 | Retained for the previous model hash during rollout |
 | Previous current-release ASR service | Existing service/tunnel retained | public 28770 | L0 fallback; not enhancement-capable |
 | Home combined service | `babel-official-inference.service`, `babel-official-inference-tunnel.service` | 8769 / 38770 | Inference stopped/disabled and excluded pending numerical validation |
 
-The active public pool is `COORDINATOR_BACKEND_URLS=http://127.0.0.1:28772,http://127.0.0.1:28771,http://127.0.0.1:28770`. The coordinator service/drop-in is `babel-cdenoise-r2-coordinator.service`; its timing cache is preserved across updates. The current Windows deployment is `D:/babel_deployments/official-inference-20261012-r1`; the previous directory remains intact. Independent Gold 0.2.50, 0.2.49 and 0.2.48 swarm donors coexist during Store rollout. The recovery-capable model hash is `d98d4e0b60124a5d8bb3a524562f41685ca4d2dcdad9ea978c064cd734ac1384`.
+The active public pool is `COORDINATOR_BACKEND_URLS=http://127.0.0.1:28773,http://127.0.0.1:28772,http://127.0.0.1:28771,http://127.0.0.1:28770`. The coordinator service/drop-in is `babel-cdenoise-r2-coordinator.service`; its timing cache is preserved across updates. The current Windows deployment is `D:/babel_deployments/official-inference-20261012-r2`; previous directories remain intact. Independent Gold 0.2.51, 0.2.50, 0.2.49 and 0.2.48 swarm donors coexist during rollout. The progress-safe recovery model hash is `28e472a062ddaee7ff023d8f2d3c5ffe49426f62d0bd32a615c60404e26db5ab`. The broken 0.2.50 Store submission was withdrawn; its local progress producer must not be published.
 
 Home maintenance upgraded the pinned driver to NVIDIA 615.71.09 open-kernel DKMS, preserved kernel 6.12.95 and the VPN module, and rebooted successfully. CfT 157.0.8097.0 exposes hardware `shader-f16` without a bypass. Desktop/Sunshine, the old Docker GPU service and tunnels were restored before a later host/network outage. Rollback packages, initramfs/config backups and the stopped pre-migration browser profile are retained under `/var/backups/babel-nvidia-20261011`.
 
