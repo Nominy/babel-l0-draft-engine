@@ -12,6 +12,21 @@ Successful validated work updates an in-memory per-operation throughput average 
 
 The finite owner deadline reserves up to the configured swarm queue-plus-lease duration, capped at half the remaining time. Official attempts share the earlier phase so one stalled endpoint cannot consume every fallback opportunity. Transport failures, invalid results, HTTP 408/429 and server errors allow fallback; ordinary input-validation errors are not retried through the swarm.
 
+### Managed deployments and home maintenance
+
+| Deployment | Supervision | Local / public-loopback port | State |
+|---|---|---|---|
+| Windows combined L0 + ZipEnhancer | `Babel Official GPU Engine`, `Babel Official GPU Reviewgen Tunnel` | 8771 / 28771 | Real public HTTP transcription, drafting and enhancement verified |
+| Previous current-release ASR service | Existing service/tunnel retained | public 28770 | L0 fallback; not enhancement-capable |
+| Home combined service | `babel-official-inference.service`, `babel-official-inference-tunnel.service` | 8769 / 38770 | Inference stopped/disabled and excluded pending numerical validation |
+
+The active public pool is `COORDINATOR_BACKEND_URLS=http://127.0.0.1:28771,http://127.0.0.1:28770`. The coordinator service/drop-in is `babel-cdenoise-r2-coordinator.service`; its timing cache is preserved across updates. Windows deployment files live at `D:/babel_deployments/official-inference-20261011-r1`. Independent Gold 0.2.49 and previously published 0.2.48 swarm donors coexist during Store rollout.
+
+Home maintenance upgraded the pinned driver to NVIDIA 615.71.09 open-kernel DKMS, preserved kernel 6.12.95 and the VPN module, and rebooted successfully. CfT 157.0.8097.0 exposes hardware `shader-f16` without a bypass. Desktop/Sunshine, the old Docker GPU service and tunnels were restored before a later host/network outage. Rollback packages, initramfs/config backups and the stopped pre-migration browser profile are retained under `/var/backups/babel-nvidia-20261011`.
+
+Functional preflight and public-sample HTTP inference passed on home, but its enhanced waveform still differs from the Windows reference by 4.565% relative RMS error; a quiet input and silent-tail case also differ. All 54 deployed core files, 424 generated shaders and 541 uploaded weight/input buffers matched across platforms. The numerical cause is not yet established; do not equate adapter availability or HTTP 200 with acceptance, weaken validators, or add port 38770 to the pool. Direct, relay and private SSH routes subsequently became unreachable, and the operator deferred further home work until physical/network access is restored.
+
+
 
 ## Linux: Docker
 
