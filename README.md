@@ -16,11 +16,12 @@ The finite owner deadline reserves up to the configured swarm queue-plus-lease d
 
 | Deployment | Supervision | Local / public-loopback port | State |
 |---|---|---|---|
-| Windows combined L0 + ZipEnhancer | `Babel Official GPU Engine`, `Babel Official GPU Reviewgen Tunnel` | 8771 / 28771 | Real public HTTP transcription, drafting and enhancement verified |
+| Windows combined L0 + ZipEnhancer 0.2.50 | `Babel Official GPU Engine 0.2.50`, `Babel Official GPU Reviewgen Tunnel 0.2.50` | 8772 / 28772 | Verified public HTTP inference with packaged full-FP32 numerical recovery |
+| Previous combined 0.2.49 service | `Babel Official GPU Engine`, `Babel Official GPU Reviewgen Tunnel` | 8771 / 28771 | Retained for the previous model hash during rollout |
 | Previous current-release ASR service | Existing service/tunnel retained | public 28770 | L0 fallback; not enhancement-capable |
 | Home combined service | `babel-official-inference.service`, `babel-official-inference-tunnel.service` | 8769 / 38770 | Inference stopped/disabled and excluded pending numerical validation |
 
-The active public pool is `COORDINATOR_BACKEND_URLS=http://127.0.0.1:28771,http://127.0.0.1:28770`. The coordinator service/drop-in is `babel-cdenoise-r2-coordinator.service`; its timing cache is preserved across updates. Windows deployment files live at `D:/babel_deployments/official-inference-20261011-r1`. Independent Gold 0.2.49 and previously published 0.2.48 swarm donors coexist during Store rollout.
+The active public pool is `COORDINATOR_BACKEND_URLS=http://127.0.0.1:28772,http://127.0.0.1:28771,http://127.0.0.1:28770`. The coordinator service/drop-in is `babel-cdenoise-r2-coordinator.service`; its timing cache is preserved across updates. The current Windows deployment is `D:/babel_deployments/official-inference-20261012-r1`; the previous directory remains intact. Independent Gold 0.2.50, 0.2.49 and 0.2.48 swarm donors coexist during Store rollout. The recovery-capable model hash is `d98d4e0b60124a5d8bb3a524562f41685ca4d2dcdad9ea978c064cd734ac1384`.
 
 Home maintenance upgraded the pinned driver to NVIDIA 615.71.09 open-kernel DKMS, preserved kernel 6.12.95 and the VPN module, and rebooted successfully. CfT 157.0.8097.0 exposes hardware `shader-f16` without a bypass. Desktop/Sunshine, the old Docker GPU service and tunnels were restored before a later host/network outage. Rollback packages, initramfs/config backups and the stopped pre-migration browser profile are retained under `/var/backups/babel-nvidia-20261011`.
 
@@ -110,7 +111,7 @@ Logs append to `.logs/engine.out.log` and `.logs/engine.err.log`. The Mac must b
 
 ### MacBook backend (detached)
 
-The public Apache vhost on `ethernetservers` routes current-release requests through `babel-cdenoise-r2-coordinator.service` on loopback port 18770. Trusted engines must not be Apache hot standbys: they accept JSON timing, not the public task-ID/capability contract. `COORDINATOR_BACKEND_URLS` selects the official pool; add an endpoint only after real two-lane L0/draft and enhancement verification, not merely host or container health. The combined Windows deployment uses private gateway port 28771; the combined home deployment uses 38770. The prior current-release ASR-only endpoint at 28770 can remain an L0 fallback during rollout.
+The public Apache vhost on `ethernetservers` routes current-release requests through `babel-cdenoise-r2-coordinator.service` on loopback port 18770. Trusted engines must not be Apache hot standbys: they accept JSON timing, not the public task-ID/capability contract. `COORDINATOR_BACKEND_URLS` selects the official pool; add an endpoint only after real two-lane L0/draft and enhancement verification, not merely host or container health. Current ports and activation status are listed in the managed deployments table above.
 
 The Mac backend (`127.0.0.1:38767`) remains detached. Restore public participation only with the current shared WebGPU backend, a dedicated profile/tunnel, and real release-compatible transcription plus completed-label drafting. The legacy Metal/SBERT launcher does not satisfy this contract. Add a verified endpoint to `COORDINATOR_BACKEND_URLS`, never directly to the public Apache balancer.
 
