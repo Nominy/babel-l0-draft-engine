@@ -16,17 +16,20 @@ The finite owner deadline reserves up to the configured swarm queue-plus-lease d
 
 | Deployment | Supervision | Local / public-loopback port | State |
 |---|---|---|---|
+| Windows combined L0 + single-pass FP32 ZipEnhancer 0.2.52 | `Babel Official GPU Engine 0.2.52`, `Babel Official GPU Reviewgen Tunnel 0.2.52` | 8774 / 28774 | Verified FP32 primary; no numerical retry or duplicate recovery assets |
 | Windows combined L0 + ZipEnhancer 0.2.51 | `Babel Official GPU Engine 0.2.51`, `Babel Official GPU Reviewgen Tunnel 0.2.51` | 8773 / 28773 | Verified inference with protocol-compatible local recovery progress |
-| Windows combined L0 + ZipEnhancer 0.2.50 | `Babel Official GPU Engine 0.2.50`, `Babel Official GPU Reviewgen Tunnel 0.2.50` | 8772 / 28772 | Verified public HTTP inference with packaged full-FP32 numerical recovery |
+| Withdrawn 0.2.50 combined service | `Babel Official GPU Engine 0.2.50`, `Babel Official GPU Reviewgen Tunnel 0.2.50` | 8772 / 28772 | Retained for rollback; excluded from the active pool |
 | Previous combined 0.2.49 service | `Babel Official GPU Engine`, `Babel Official GPU Reviewgen Tunnel` | 8771 / 28771 | Retained for the previous model hash during rollout |
-| Previous current-release ASR service | Existing service/tunnel retained | public 28770 | L0 fallback; not enhancement-capable |
+| Previous ASR-only service | Existing service/tunnel retained | public 28770 | Retained for rollback; excluded from the active pool |
 | Home combined service | `babel-official-inference.service`, `babel-official-inference-tunnel.service` | 8769 / 38770 | Inference stopped/disabled and excluded pending numerical validation |
 
-The active public pool is `COORDINATOR_BACKEND_URLS=http://127.0.0.1:28773,http://127.0.0.1:28772,http://127.0.0.1:28771,http://127.0.0.1:28770`. The coordinator service/drop-in is `babel-cdenoise-r2-coordinator.service`; its timing cache is preserved across updates. The current Windows deployment is `D:/babel_deployments/official-inference-20261012-r2`; previous directories remain intact. Independent Gold 0.2.51, 0.2.50, 0.2.49 and 0.2.48 swarm donors coexist during rollout. The progress-safe recovery model hash is `28e472a062ddaee7ff023d8f2d3c5ffe49426f62d0bd32a615c60404e26db5ab`. The broken 0.2.50 Store submission was withdrawn; its local progress producer must not be published.
+The active public pool is `COORDINATOR_BACKEND_URLS=http://127.0.0.1:28774,http://127.0.0.1:28773,http://127.0.0.1:28771`: the new FP32 primary, the progress-safe previous version, and the published previous-model service. Withdrawn/duplicate official routes are not charged a share of the attempt budget. The coordinator service/drop-in is `babel-cdenoise-r2-coordinator.service`; its timing cache is preserved. Current Windows files are in `D:/babel_deployments/official-inference-20261012-r3`; older services/directories and versioned donors remain intact during rollout. The primary-FP32 model hash is `e49ff4eddca319ade69d7c34f10f5c67dab8bd39060b273fb070edd107fa5bbc`. ZipEnhancer itself no longer requires `shader-f16`; the combined GigaAM/C-denoise service still does. The 0.2.51 Store review is not replaced by this root-fix preparation.
 
 Home maintenance upgraded the pinned driver to NVIDIA 615.71.09 open-kernel DKMS, preserved kernel 6.12.95 and the VPN module, and rebooted successfully. CfT 157.0.8097.0 exposes hardware `shader-f16` without a bypass. Desktop/Sunshine, the old Docker GPU service and tunnels were restored before a later host/network outage. Rollback packages, initramfs/config backups and the stopped pre-migration browser profile are retained under `/var/backups/babel-nvidia-20261011`.
 
 Functional preflight and public-sample HTTP inference passed on home, but its enhanced waveform still differs from the Windows reference by 4.565% relative RMS error; a quiet input and silent-tail case also differ. All 54 deployed core files, 424 generated shaders and 541 uploaded weight/input buffers matched across platforms. The numerical cause is not yet established; do not equate adapter availability or HTTP 200 with acceptance, weaken validators, or add port 38770 to the pool. Direct, relay and private SSH routes subsequently became unreachable, and the operator deferred further home work until physical/network access is restored.
+
+Those home waveform measurements used the older mixed-precision graph. They neither validate nor reject the new single-pass FP32 primary: home must be reconnected and independently revalidated before it is admitted again.
 
 
 
